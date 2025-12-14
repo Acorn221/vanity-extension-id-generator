@@ -290,8 +290,7 @@ int main(int argc, char* argv[]) {
         workers.reserve(num_workers);
         
         for (unsigned int i = 0; i < num_workers; i++) {
-            // Use optimized worker loop with Apple Accelerate and larger batches
-            workers.emplace_back(worker_loop_dict_fast, std::cref(dict), std::ref(state),
+            workers.emplace_back(worker_loop_dict, std::cref(dict), std::ref(state),
                                 std::cref(output_path), std::ref(file_mutex));
         }
         
@@ -491,8 +490,7 @@ int main(int argc, char* argv[]) {
     workers.reserve(num_workers);
     
     for (unsigned int i = 0; i < num_workers; i++) {
-        // Use optimized worker loop with Apple Accelerate and larger batches
-        workers.emplace_back(worker_loop_fast, std::cref(config), std::ref(state));
+        workers.emplace_back(worker_loop, std::cref(config), std::ref(state));
     }
     
     // Progress monitoring loop

@@ -8,70 +8,8 @@
 #include <unordered_set>
 #include <fstream>
 #include <openssl/evp.h>
-#include <openssl/bn.h>
 
 namespace vanity {
-
-// ============================================================================
-// OPTIMIZATION: Small prime sieve for fast candidate filtering
-// ============================================================================
-
-// First 256 primes for sieving (filters out ~77% of odd candidates)
-extern const uint16_t SMALL_PRIMES[256];
-extern const size_t NUM_SMALL_PRIMES;
-
-/**
- * Pre-computed sieve data for fast prime candidate filtering
- * Checking divisibility by small primes is much faster than Miller-Rabin
- */
-struct PrimeSieve {
-    // Remainders for incremental sieving
-    std::vector<uint32_t> remainders;
-    
-    // Initialize sieve for a starting number
-    void init(const BIGNUM* start, BN_CTX* ctx);
-    
-    // Check if current candidate passes small prime test
-    // Returns false if definitely composite, true if might be prime
-    bool check_candidate() const;
-    
-    // Advance to next odd candidate (increment by 2)
-    void advance();
-};
-
-/**
- * Thread-local context for optimized key generation
- * Reuses expensive resources across iterations
- */
-struct ThreadContext {
-    EVP_PKEY_CTX* keygen_ctx = nullptr;
-    BN_CTX* bn_ctx = nullptr;
-    PrimeSieve sieve_p;
-    PrimeSieve sieve_q;
-    
-    // Scratch BIGNUMs for prime generation
-    BIGNUM* candidate = nullptr;
-    BIGNUM* tmp = nullptr;
-    
-    ThreadContext();
-    ~ThreadContext();
-    
-    // Non-copyable
-    ThreadContext(const ThreadContext&) = delete;
-    ThreadContext& operator=(const ThreadContext&) = delete;
-};
-
-/**
- * Generate RSA key with optimized prime generation
- * Uses small prime sieving to filter candidates before Miller-Rabin
- */
-EVP_PKEY* generate_rsa_key_fast(ThreadContext& ctx);
-
-/**
- * Compute extension ID using Apple Accelerate SHA-256 (if available)
- * Falls back to OpenSSL on non-Apple platforms
- */
-bool compute_extension_id_fast(EVP_PKEY* pkey, char* ext_id);
 
 // Match position for target string
 enum class MatchPosition {
@@ -172,11 +110,6 @@ const char* position_to_string(MatchPosition pos);
 void worker_loop(const SearchConfig& config, SharedState& state);
 
 /**
- * OPTIMIZED worker loop using fast prime generation and Apple Accelerate
- */
-void worker_loop_fast(const SearchConfig& config, SharedState& state);
-
-/**
  * Compute extension ID from an EVP_PKEY
  * 
  * @param pkey The RSA key pair
@@ -221,12 +154,6 @@ std::vector<std::pair<std::string, std::string>> check_dictionary(
  */
 void worker_loop_dict(const Dictionary& dict, SharedState& state, 
                       const std::string& output_file, std::mutex& file_mutex);
-
-/**
- * OPTIMIZED dictionary worker loop using fast prime generation
- */
-void worker_loop_dict_fast(const Dictionary& dict, SharedState& state,
-                           const std::string& output_file, std::mutex& file_mutex);
 
 /**
  * Extract just the primes p and q from an RSA key (compact storage)
