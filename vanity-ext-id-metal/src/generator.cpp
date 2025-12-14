@@ -9,6 +9,7 @@
 #include <openssl/bn.h>
 #include <openssl/core_names.h>
 #include <openssl/param_build.h>
+#include <openssl/rand.h>
 
 #include <cstring>
 #include <algorithm>
@@ -18,7 +19,304 @@
 #include <iomanip>
 #include <chrono>
 
+// Apple Accelerate framework for faster SHA-256
+#ifdef USE_APPLE_ACCELERATE
+#include <CommonCrypto/CommonDigest.h>
+#endif
+
 namespace vanity {
+
+// ============================================================================
+// SMALL PRIME TABLE FOR SIEVING
+// First 256 primes - checking divisibility filters out ~77% of odd candidates
+// ============================================================================
+const uint16_t SMALL_PRIMES[256] = {
+    2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53,
+    59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131,
+    137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193, 197, 199, 211, 223,
+    227, 229, 233, 239, 241, 251, 257, 263, 269, 271, 277, 281, 283, 293, 307, 311,
+    313, 317, 331, 337, 347, 349, 353, 359, 367, 373, 379, 383, 389, 397, 401, 409,
+    419, 421, 431, 433, 439, 443, 449, 457, 461, 463, 467, 479, 487, 491, 499, 503,
+    509, 521, 523, 541, 547, 557, 563, 569, 571, 577, 587, 593, 599, 601, 607, 613,
+    617, 619, 631, 641, 643, 647, 653, 659, 661, 673, 677, 683, 691, 701, 709, 719,
+    727, 733, 739, 743, 751, 757, 761, 769, 773, 787, 797, 809, 811, 821, 823, 827,
+    829, 839, 853, 857, 859, 863, 877, 881, 883, 887, 907, 911, 919, 929, 937, 941,
+    947, 953, 967, 971, 977, 983, 991, 997, 1009, 1013, 1019, 1021, 1031, 1033, 1039, 1049,
+    1051, 1061, 1063, 1069, 1087, 1091, 1093, 1097, 1103, 1109, 1117, 1123, 1129, 1151, 1153, 1163,
+    1171, 1181, 1187, 1193, 1201, 1213, 1217, 1223, 1229, 1231, 1237, 1249, 1259, 1277, 1279, 1283,
+    1289, 1291, 1297, 1301, 1303, 1307, 1319, 1321, 1327, 1361, 1367, 1373, 1381, 1399, 1409, 1423,
+    1427, 1429, 1433, 1439, 1447, 1451, 1453, 1459, 1471, 1481, 1483, 1487, 1489, 1493, 1499, 1511,
+    1523, 1531, 1543, 1549, 1553, 1559, 1567, 1571, 1579, 1583, 1597, 1601, 1607, 1609, 1613, 1619
+};
+const size_t NUM_SMALL_PRIMES = 256;
+
+// ============================================================================
+// PRIME SIEVE IMPLEMENTATION
+// ============================================================================
+
+void PrimeSieve::init(const BIGNUM* start, BN_CTX* ctx) {
+    remainders.resize(NUM_SMALL_PRIMES);
+    
+    BIGNUM* rem = BN_new();
+    BIGNUM* prime = BN_new();
+    
+    // Compute start mod p for each small prime
+    for (size_t i = 0; i < NUM_SMALL_PRIMES; i++) {
+        BN_set_word(prime, SMALL_PRIMES[i]);
+        BN_mod(rem, start, prime, ctx);
+        remainders[i] = static_cast<uint32_t>(BN_get_word(rem));
+    }
+    
+    BN_free(rem);
+    BN_free(prime);
+}
+
+bool PrimeSieve::check_candidate() const {
+    // Skip prime 2 (index 0) - we only check odd numbers
+    for (size_t i = 1; i < NUM_SMALL_PRIMES; i++) {
+        if (remainders[i] == 0) {
+            return false;  // Divisible by small prime, definitely composite
+        }
+    }
+    return true;  // Passed sieve, might be prime
+}
+
+void PrimeSieve::advance() {
+    // We increment by 2 (odd numbers only)
+    for (size_t i = 0; i < NUM_SMALL_PRIMES; i++) {
+        remainders[i] = (remainders[i] + 2) % SMALL_PRIMES[i];
+    }
+}
+
+// ============================================================================
+// THREAD CONTEXT IMPLEMENTATION
+// ============================================================================
+
+ThreadContext::ThreadContext() {
+    // Create keygen context
+    keygen_ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
+    if (keygen_ctx) {
+        EVP_PKEY_keygen_init(keygen_ctx);
+        EVP_PKEY_CTX_set_rsa_keygen_bits(keygen_ctx, 2048);
+    }
+    
+    // Create BN context for bignum operations
+    bn_ctx = BN_CTX_new();
+    
+    // Allocate scratch BIGNUMs
+    candidate = BN_new();
+    tmp = BN_new();
+}
+
+ThreadContext::~ThreadContext() {
+    if (keygen_ctx) EVP_PKEY_CTX_free(keygen_ctx);
+    if (bn_ctx) BN_CTX_free(bn_ctx);
+    if (candidate) BN_free(candidate);
+    if (tmp) BN_free(tmp);
+}
+
+// ============================================================================
+// FAST EXTENSION ID COMPUTATION (Apple Accelerate)
+// ============================================================================
+
+bool compute_extension_id_fast(EVP_PKEY* pkey, char* ext_id) {
+    // Get the public key in SPKI/DER format
+    unsigned char* der_buf = nullptr;
+    int der_len = i2d_PUBKEY(pkey, &der_buf);
+    
+    if (der_len <= 0 || der_buf == nullptr) {
+        return false;
+    }
+    
+#ifdef USE_APPLE_ACCELERATE
+    // Use Apple's CommonCrypto - optimized for Apple Silicon
+    unsigned char hash[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(der_buf, static_cast<CC_LONG>(der_len), hash);
+#else
+    // Fall back to OpenSSL
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256(der_buf, static_cast<size_t>(der_len), hash);
+#endif
+    
+    OPENSSL_free(der_buf);
+    
+    // Convert first 16 bytes to extension ID (a-p encoding)
+    for (int i = 0; i < 16; i++) {
+        ext_id[i * 2]     = 'a' + (hash[i] >> 4);
+        ext_id[i * 2 + 1] = 'a' + (hash[i] & 0x0f);
+    }
+    ext_id[32] = '\0';
+    
+    return true;
+}
+
+// ============================================================================
+// OPTIMIZED WORKER LOOPS
+// ============================================================================
+
+// Generate RSA key using OpenSSL's optimized keygen
+// The ThreadContext provides reusable context for efficiency
+EVP_PKEY* generate_rsa_key_fast(ThreadContext& ctx) {
+    if (!ctx.keygen_ctx) return nullptr;
+    
+    EVP_PKEY* pkey = nullptr;
+    if (EVP_PKEY_keygen(ctx.keygen_ctx, &pkey) <= 0) {
+        return nullptr;
+    }
+    return pkey;
+}
+
+__attribute__((hot))
+void worker_loop_fast(const SearchConfig& config, SharedState& state) {
+    ThreadContext ctx;
+    if (!ctx.bn_ctx) {
+        return;
+    }
+    
+    char ext_id[33];
+    uint64_t local_count = 0;
+    constexpr uint64_t BATCH_SIZE = 50;  // Smaller batch for smoother display
+    
+    while (!state.found.load(std::memory_order_relaxed)) {
+        // Use fast prime generation with sieving
+        EVP_PKEY* pkey = generate_rsa_key_fast(ctx);
+        if (!pkey) {
+            // Fall back to OpenSSL if fast generation fails
+            if (ctx.keygen_ctx && EVP_PKEY_keygen(ctx.keygen_ctx, &pkey) <= 0) {
+                continue;
+            }
+        }
+        
+        if (pkey && compute_extension_id_fast(pkey, ext_id)) {
+            if (check_match(ext_id, config)) {
+                bool expected = false;
+                if (state.found.compare_exchange_strong(expected, true,
+                        std::memory_order_release, std::memory_order_relaxed)) {
+                    std::lock_guard<std::mutex> lock(state.result_mutex);
+                    state.result.found = true;
+                    state.result.extension_id = ext_id;
+                    state.result.private_key_pem = export_private_key_pem(pkey);
+                    state.result.public_key_base64 = export_public_key_base64(pkey);
+                }
+            }
+        }
+        
+        if (pkey) EVP_PKEY_free(pkey);
+        
+        if (++local_count % BATCH_SIZE == 0) {
+            state.attempts.fetch_add(BATCH_SIZE, std::memory_order_relaxed);
+        }
+    }
+    
+    uint64_t remaining = local_count % BATCH_SIZE;
+    if (remaining > 0) {
+        state.attempts.fetch_add(remaining, std::memory_order_relaxed);
+    }
+}
+
+__attribute__((hot))
+void worker_loop_dict_fast(const Dictionary& dict, SharedState& state,
+                           const std::string& output_file, std::mutex& file_mutex) {
+    ThreadContext ctx;
+    if (!ctx.bn_ctx) {
+        return;
+    }
+    
+    char ext_id[33];
+    uint64_t local_count = 0;
+    constexpr uint64_t BATCH_SIZE = 50;  // Smaller batch for smoother display
+    
+    while (!state.stop.load(std::memory_order_relaxed)) {
+        // Use fast prime generation with sieving
+        EVP_PKEY* pkey = generate_rsa_key_fast(ctx);
+        if (!pkey) {
+            // Fall back to OpenSSL if fast generation fails
+            if (ctx.keygen_ctx && EVP_PKEY_keygen(ctx.keygen_ctx, &pkey) <= 0) {
+                continue;
+            }
+            if (!pkey) continue;
+        }
+        
+        if (compute_extension_id_fast(pkey, ext_id)) {
+            auto matches = check_dictionary(ext_id, dict);
+            
+            // Also check for cool patterns
+            std::string cool_pattern = detect_cool_pattern(ext_id);
+            if (!cool_pattern.empty()) {
+                matches.emplace_back("PATTERN", cool_pattern);
+            }
+            
+            if (!matches.empty()) {
+                // Find the longest match
+                size_t longest_match_len = 0;
+                for (const auto& m : matches) {
+                    if (m.first.length() > longest_match_len) {
+                        longest_match_len = m.first.length();
+                    }
+                }
+                
+                // Check limit
+                uint64_t limit = dict.length_limits[longest_match_len];
+                if (limit > 0) {
+                    uint64_t current = state.length_counts[longest_match_len].load(std::memory_order_relaxed);
+                    if (current >= limit) {
+                        EVP_PKEY_free(pkey);
+                        if (++local_count % BATCH_SIZE == 0) {
+                            state.attempts.fetch_add(BATCH_SIZE, std::memory_order_relaxed);
+                        }
+                        continue;
+                    }
+                    state.length_counts[longest_match_len].fetch_add(1, std::memory_order_relaxed);
+                }
+                
+                CompactKey compact = extract_compact_key(pkey);
+                std::string pub_b64 = export_public_key_base64(pkey);
+                
+                std::ostringstream match_desc;
+                for (size_t i = 0; i < matches.size(); i++) {
+                    if (i > 0) match_desc << ",";
+                    match_desc << matches[i].first << "@" << matches[i].second;
+                }
+                
+                {
+                    std::lock_guard<std::mutex> lock(file_mutex);
+                    std::ofstream out(output_file, std::ios::app);
+                    if (out.is_open()) {
+                        out << ext_id << ","
+                            << match_desc.str() << ","
+                            << compact.p_hex << ","
+                            << compact.q_hex << ","
+                            << pub_b64 << "\n";
+                        out.flush();
+                    }
+                }
+                
+                state.matches_found.fetch_add(1, std::memory_order_relaxed);
+                
+                if (state.dict_matches.size() < 10000) {
+                    std::lock_guard<std::mutex> lock(state.dict_mutex);
+                    DictMatch dm;
+                    dm.extension_id = ext_id;
+                    dm.compact_key = compact;
+                    dm.public_key_base64 = pub_b64;
+                    dm.matches = matches;
+                    state.dict_matches.push_back(std::move(dm));
+                }
+            }
+        }
+        
+        EVP_PKEY_free(pkey);
+        
+        if (++local_count % BATCH_SIZE == 0) {
+            state.attempts.fetch_add(BATCH_SIZE, std::memory_order_relaxed);
+        }
+    }
+    
+    uint64_t remaining = local_count % BATCH_SIZE;
+    if (remaining > 0) {
+        state.attempts.fetch_add(remaining, std::memory_order_relaxed);
+    }
+}
 
 bool validate_target(const std::string& target) {
     if (target.empty()) {

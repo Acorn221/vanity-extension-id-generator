@@ -1,6 +1,8 @@
-# Vanity Extension ID Generator - Metal GPU Version
+# Chrome Extension Vanity ID Generator (Metal GPU Version)
 
 Generate vanity Chrome extension IDs using Apple Silicon GPU acceleration.
+
+**Note:** This is the Metal GPU-accelerated version for Apple Silicon. For CPU-only version, see [vanity-ext-id-cpu](../vanity-ext-id-cpu/).
 
 ## Overview
 
@@ -17,7 +19,7 @@ cmake .. && make -j8
 ./generate-prime-pool 10000 prime_pool_10k.bin
 
 # 3. Search for vanity IDs
-./vanity-ext-id-metal -p prime_pool_10k.bin -d ../wordlist.txt -o results.csv
+./vanity-ext-id-metal -p prime_pool_10k.bin -d ../../wordlist.txt -o results.csv
 
 # 4. Reconstruct a key from results
 cd ..
@@ -83,7 +85,7 @@ chrome
 
 **Dictionary mode (recommended):**
 ```bash
-./vanity-ext-id-metal -p prime_pool_10k.bin -d wordlist.txt -o results.csv
+./vanity-ext-id-metal -p prime_pool_10k.bin -d ../wordlist.txt -o results.csv
 ```
 
 **Search for specific prefix:**
@@ -210,7 +212,7 @@ Results are appended to the output CSV, not overwritten. Delete or use a new fil
 
 ```bash
 rm results.csv  # Clear old results
-./vanity-ext-id-metal -p new_pool.bin -d wordlist.txt -o results.csv
+./vanity-ext-id-metal -p new_pool.bin -d ../wordlist.txt -o results.csv
 ```
 
 ### Per-Length Limits
