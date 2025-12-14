@@ -163,19 +163,25 @@ GPUDictionary load_dictionary_gpu(const std::string& filepath, size_t min_len, s
 // Check extension ID against dictionary (same logic as CPU version)
 std::vector<std::pair<std::string, std::string>> check_dictionary_cpu(
     const std::string& ext_id, const GPUDictionary& dict) {
-    
+
     std::vector<std::pair<std::string, std::string>> matches;
-    
+
+    // Safety check - ext_id must be 32 chars
+    if (ext_id.length() != 32) {
+        return matches;
+    }
+
     // Check prefix (longest match wins)
     for (const auto& word : dict.prefixes) {
-        if (ext_id.compare(0, word.length(), word) == 0) {
+        if (word.length() <= ext_id.length() && ext_id.compare(0, word.length(), word) == 0) {
             matches.emplace_back(word, "start");
             break;
         }
     }
-    
+
     // Check suffix (longest match wins)
     for (const auto& word : dict.suffixes) {
+        if (word.length() > 32) continue;
         size_t pos = 32 - word.length();
         if (ext_id.compare(pos, word.length(), word) == 0) {
             bool already = false;
@@ -216,7 +222,12 @@ std::vector<std::pair<std::string, std::string>> check_dictionary_cpu(
 // Pattern detection (same as CPU version)
 std::string detect_cool_pattern_cpu(const std::string& id) {
     std::vector<std::string> patterns;
-    
+
+    // Safety check
+    if (id.length() != 32) {
+        return "";
+    }
+
     // 1. Repeated characters (6+ in a row)
     for (size_t i = 0; i < 32; ) {
         char c = id[i];
@@ -545,8 +556,30 @@ int main(int argc, char* argv[]) {
     
     // Process GPU results on CPU
     std::cout << "\n\nProcessing " << gpu_results.size() << " GPU matches...\n";
-    
+
+    auto process_start = std::chrono::steady_clock::now();
+    size_t processed = 0;
+    size_t total_to_process = gpu_results.size();
+
     for (const auto& gpu_match : gpu_results) {
+        processed++;
+
+        // Progress update every 10000 items
+        if (processed % 10000 == 0 || processed == total_to_process) {
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - process_start).count();
+            double rate = (elapsed > 0) ? processed / elapsed : 0;
+            double eta = (rate > 0) ? (total_to_process - processed) / rate : 0;
+            double pct = 100.0 * processed / total_to_process;
+
+            std::cout << "\rProcessing: " << std::fixed << std::setprecision(1) << pct << "%"
+                      << " | " << format_number(processed) << "/" << format_number(total_to_process)
+                      << " | Rate: " << format_number(static_cast<uint64_t>(rate)) << "/s"
+                      << " | Matches: " << matches_found
+                      << " | ETA: " << format_time(eta)
+                      << "     " << std::flush;
+        }
+
         std::string ext_id = gpu_match.extension_id;
         
         // Check dictionary matches

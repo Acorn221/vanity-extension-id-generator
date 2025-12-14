@@ -305,106 +305,169 @@ public:
         size_t min_len,
         ProgressCallback callback
     ) {
-        // Extract unique 3-char prefixes and suffixes from dictionary
-        // This reduces 3000+ words to ~200-300 unique patterns
-        std::set<std::string> unique_prefixes;
-        std::set<std::string> unique_suffixes;
-        
-        for (const auto& word : words) {
-            if (word.size() < min_len) continue;
-            if (word.size() >= 3) {
-                unique_prefixes.insert(word.substr(0, 3));
-                unique_suffixes.insert(word.substr(word.size() - 3, 3));
-            }
+        std::vector<GPUMatch> results;
+
+        if (!isAvailable() || primeCount_ == 0 || !dictPipeline_) {
+            std::cerr << "Metal: Dictionary pipeline not available\n";
+            return results;
         }
-        
-        std::cout << "Dictionary: " << words.size() << " words -> " 
-                  << unique_prefixes.size() << " unique prefixes, "
-                  << unique_suffixes.size() << " unique suffixes\n";
-        
-        std::vector<GPUMatch> allResults;
-        std::set<std::pair<uint32_t, uint32_t>> seen_pairs;  // Deduplicate
-        
+
         running_ = true;
         stopRequested_ = false;
-        quietMode_ = true;  // Suppress per-search logs
+
+        // Filter words by min length and build packed dictionary buffer
+        std::vector<std::string> validWords;
+        for (const auto& word : words) {
+            if (word.size() >= min_len && word.size() <= 10) {
+                validWords.push_back(word);
+            }
+        }
+
+        std::cout << "Dictionary: " << validWords.size() << " valid words (min " << min_len << " chars)\n";
+
+        // Pack dictionary: null-separated words
+        std::vector<char> dictData;
+        std::vector<uint32_t> wordOffsets;
+
+        for (const auto& word : validWords) {
+            wordOffsets.push_back(static_cast<uint32_t>(dictData.size()));
+            for (char c : word) {
+                dictData.push_back(c);
+            }
+            dictData.push_back('\0');
+        }
+        wordOffsets.push_back(static_cast<uint32_t>(dictData.size()));  // End marker
+
+        std::cout << "Dictionary buffer: " << dictData.size() << " bytes, "
+                  << wordOffsets.size() - 1 << " words\n";
+
+        // Create GPU buffers for dictionary
+        id<MTLBuffer> dictBuffer = [device_ newBufferWithBytes:dictData.data()
+                                                        length:dictData.size()
+                                                       options:MTLResourceStorageModeShared];
+
+        id<MTLBuffer> offsetsBuffer = [device_ newBufferWithBytes:wordOffsets.data()
+                                                           length:wordOffsets.size() * sizeof(uint32_t)
+                                                          options:MTLResourceStorageModeShared];
+
+        // Parameters: [pool_size, num_words, min_len, start_idx]
+        uint32_t params[4] = {
+            static_cast<uint32_t>(primeCount_),
+            static_cast<uint32_t>(validWords.size()),
+            static_cast<uint32_t>(min_len),
+            0  // start_idx
+        };
+        id<MTLBuffer> paramsBuffer = [device_ newBufferWithBytes:params
+                                                          length:sizeof(params)
+                                                         options:MTLResourceStorageModeShared];
+
+        // Match count buffer (atomic)
+        id<MTLBuffer> matchCountBuffer = [device_ newBufferWithLength:sizeof(uint32_t)
+                                                              options:MTLResourceStorageModeShared];
+        memset([matchCountBuffer contents], 0, sizeof(uint32_t));
+
+        // Matches buffer - needs to be large enough for all potential matches
+        // With 10k primes and 50M pairs, dictionary can find millions of matches
+        size_t maxMatches = 10000000;  // 10M matches max
+        id<MTLBuffer> matchesBuffer = [device_ newBufferWithLength:maxMatches * sizeof(ShaderMatchResult)
+                                                           options:MTLResourceStorageModeShared];
+
+        if (!matchesBuffer) {
+            // If 10M is too big, try smaller
+            maxMatches = 1000000;
+            matchesBuffer = [device_ newBufferWithLength:maxMatches * sizeof(ShaderMatchResult)
+                                                 options:MTLResourceStorageModeShared];
+        }
+        std::cout << "Match buffer: " << (maxMatches * sizeof(ShaderMatchResult) / 1024 / 1024) << " MB (max " << maxMatches << " matches)\n";
 
         uint64_t totalPairs = (uint64_t)primeCount_ * (primeCount_ - 1) / 2;
-        size_t total_patterns = unique_prefixes.size() + unique_suffixes.size();
-        size_t patterns_done = 0;
 
         auto startTime = std::chrono::steady_clock::now();
 
-        // Search all unique prefixes
-        size_t prefix_num = 0;
-        for (const auto& prefix : unique_prefixes) {
-            if (stopRequested_) break;
-            prefix_num++;
+        // Process in batches - use larger batch for better GPU utilization
+        uint32_t batchSize = 2048;
 
-            std::cout << "\r[" << prefix_num << "/" << unique_prefixes.size()
-                      << "] Searching prefix: " << prefix << "...     " << std::flush;
+        for (uint32_t startIdx = 0; startIdx < primeCount_ && !stopRequested_; startIdx += batchSize) {
+            @autoreleasepool {
+                // Update start index
+                uint32_t* paramsPtr = static_cast<uint32_t*>([paramsBuffer contents]);
+                paramsPtr[3] = startIdx;
 
-            SearchConfig config;
-            config.target_prefix = prefix;
-            config.target_suffix = "";
+                // Create command buffer
+                id<MTLCommandBuffer> commandBuffer = [commandQueue_ commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
 
-            auto results = search(config, nullptr);  // No per-pattern callback
-            
-            for (auto& r : results) {
-                auto key = std::make_pair(r.prime_idx_p, r.prime_idx_q);
-                if (seen_pairs.find(key) == seen_pairs.end()) {
-                    seen_pairs.insert(key);
-                    allResults.push_back(r);
+                [encoder setComputePipelineState:dictPipeline_];
+                [encoder setBuffer:primePoolBuffer_ offset:0 atIndex:0];
+                [encoder setBuffer:dictBuffer offset:0 atIndex:1];
+                [encoder setBuffer:offsetsBuffer offset:0 atIndex:2];
+                [encoder setBuffer:paramsBuffer offset:0 atIndex:3];
+                [encoder setBuffer:matchCountBuffer offset:0 atIndex:4];
+                [encoder setBuffer:matchesBuffer offset:0 atIndex:5];
+
+                // Calculate grid size (2D: i × j pairs)
+                uint32_t gridWidth = MIN(batchSize, static_cast<uint32_t>(primeCount_) - startIdx);
+                uint32_t gridHeight = static_cast<uint32_t>(primeCount_) - startIdx;
+
+                MTLSize gridSize = MTLSizeMake(gridWidth, gridHeight, 1);
+                MTLSize threadGroupSize = MTLSizeMake(
+                    MIN(32u, gridWidth),
+                    MIN(32u, gridHeight),
+                    1
+                );
+
+                [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
+                [encoder endEncoding];
+
+                [commandBuffer commit];
+                [commandBuffer waitUntilCompleted];
+
+                // Calculate progress based on how many "rows" we've completed
+                // Each row i processes pairs (i, i+1), (i, i+2), ..., (i, n-1)
+                // So row i has (n-1-i) pairs. Rows 0..startIdx-1 are complete.
+                uint32_t endIdx = MIN(startIdx + batchSize, static_cast<uint32_t>(primeCount_));
+                uint64_t pairsChecked = 0;
+                for (uint32_t row = 0; row < endIdx; row++) {
+                    pairsChecked += (primeCount_ - 1 - row);
+                }
+
+                uint32_t matchCount = *static_cast<uint32_t*>([matchCountBuffer contents]);
+
+                if (callback) {
+                    callback(pairsChecked, totalPairs, matchCount);
                 }
             }
-            
-            patterns_done++;
-            if (callback) {
-                callback(patterns_done * totalPairs / total_patterns, totalPairs, allResults.size());
-            }
         }
-        
-        // Search all unique suffixes
-        std::cout << "\n";  // Newline after prefixes
-        size_t suffix_num = 0;
-        for (const auto& suffix : unique_suffixes) {
-            if (stopRequested_) break;
-            suffix_num++;
 
-            std::cout << "\r[" << suffix_num << "/" << unique_suffixes.size()
-                      << "] Searching suffix: " << suffix << "...     " << std::flush;
+        // Collect results
+        uint32_t matchCount = *static_cast<uint32_t*>([matchCountBuffer contents]);
+        ShaderMatchResult* matchData = static_cast<ShaderMatchResult*>([matchesBuffer contents]);
 
-            SearchConfig config;
-            config.target_prefix = "";
-            config.target_suffix = suffix;
-
-            auto results = search(config, nullptr);
-            
-            for (auto& r : results) {
-                auto key = std::make_pair(r.prime_idx_p, r.prime_idx_q);
-                if (seen_pairs.find(key) == seen_pairs.end()) {
-                    seen_pairs.insert(key);
-                    allResults.push_back(r);
-                }
-            }
-            
-            patterns_done++;
-            if (callback) {
-                callback(patterns_done * totalPairs / total_patterns, totalPairs, allResults.size());
-            }
+        std::cout << "\nCollecting " << matchCount << " GPU matches";
+        if (matchCount > maxMatches) {
+            std::cout << " (capped at " << maxMatches << ")";
         }
-        
-        std::cout << "\n";  // Newline after suffixes
+        std::cout << "...\n";
+
+        size_t collectCount = std::min(static_cast<size_t>(matchCount), maxMatches);
+        for (size_t i = 0; i < collectCount; i++) {
+            GPUMatch match;
+            match.prime_idx_p = matchData[i].prime_idx_p;
+            match.prime_idx_q = matchData[i].prime_idx_q;
+            match.extension_id = std::string(matchData[i].ext_id);
+            match.match_type = matchData[i].match_type;
+            results.push_back(match);
+        }
 
         auto endTime = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(endTime - startTime).count();
 
-        std::cout << "Metal: Searched " << total_patterns << " patterns, found "
-                  << allResults.size() << " candidate IDs in " << elapsed << "s\n";
+        std::cout << "Metal: Dictionary search complete. " << totalPairs << " pairs in "
+                  << elapsed << "s (" << (totalPairs / elapsed / 1e6) << "M pairs/s)\n";
+        std::cout << "Found " << results.size() << " matches\n";
 
-        quietMode_ = false;  // Restore normal logging
         running_ = false;
-        return allResults;
+        return results;
     }
     
     void stop() {

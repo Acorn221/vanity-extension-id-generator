@@ -461,7 +461,7 @@ kernel void vanity_search_dict(
         
         if (prefix_match || suffix_match) {
             uint match_idx = atomic_fetch_add_explicit(match_count, 1, memory_order_relaxed);
-            if (match_idx < 10000) {
+            if (match_idx < 10000000) {  // 10M limit to match CPU buffer
                 matches[match_idx].prime_idx_p = i;
                 matches[match_idx].prime_idx_q = j;
                 for (uint k = 0; k < 32; k++) {
