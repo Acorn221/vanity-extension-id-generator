@@ -367,8 +367,8 @@ public:
         memset([matchCountBuffer contents], 0, sizeof(uint32_t));
 
         // Matches buffer - needs to be large enough for all potential matches
-        // With 10k primes and 50M pairs, dictionary can find millions of matches
-        size_t maxMatches = 10000000;  // 10M matches max
+        // With 10k primes and 500M pairs, dictionary can find millions of matches
+        size_t maxMatches = 500000000;  // 50M matches max (~2.3GB)
         id<MTLBuffer> matchesBuffer = [device_ newBufferWithLength:maxMatches * sizeof(ShaderMatchResult)
                                                            options:MTLResourceStorageModeShared];
 

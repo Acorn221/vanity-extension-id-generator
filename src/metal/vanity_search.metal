@@ -433,15 +433,93 @@ kernel void vanity_search_dict(
         ext_id[k*2+1] = 'a' + (hash[k] & 0x0F);
     }
     ext_id[32] = '\0';
-    
+
+    // =========================================================================
+    // Check for cool patterns FIRST (before dictionary)
+    // =========================================================================
+    bool has_pattern = false;
+
+    // 1. Check for repeated characters (6+ in a row)
+    for (uint pos = 0; pos < 27 && !has_pattern; pos++) {
+        char c = ext_id[pos];
+        uint count = 1;
+        while (pos + count < 32 && ext_id[pos + count] == c) count++;
+        if (count >= 6) {
+            has_pattern = true;
+        }
+    }
+
+    // 2. Check for same-char prefix (5+)
+    if (!has_pattern) {
+        char first = ext_id[0];
+        uint prefix_count = 1;
+        while (prefix_count < 32 && ext_id[prefix_count] == first) prefix_count++;
+        if (prefix_count >= 5) {
+            has_pattern = true;
+        }
+    }
+
+    // 3. Check for same-char suffix (5+)
+    if (!has_pattern) {
+        char last = ext_id[31];
+        uint suffix_count = 1;
+        while (suffix_count < 32 && ext_id[31 - suffix_count] == last) suffix_count++;
+        if (suffix_count >= 5) {
+            has_pattern = true;
+        }
+    }
+
+    // 4. Check for ascending sequence from 'a' (5+ chars like "abcde")
+    if (!has_pattern) {
+        for (uint pos = 0; pos < 28 && !has_pattern; pos++) {
+            if (ext_id[pos] == 'a') {
+                uint len = 1;
+                while (pos + len < 32 && ext_id[pos + len] == ext_id[pos + len - 1] + 1) len++;
+                if (len >= 5) {
+                    has_pattern = true;
+                }
+            }
+        }
+    }
+
+    // 5. Check for palindrome at start (8+ chars)
+    if (!has_pattern) {
+        for (uint len = 12; len >= 8 && !has_pattern; len--) {
+            bool is_palindrome = true;
+            for (uint p = 0; p < len / 2 && is_palindrome; p++) {
+                if (ext_id[p] != ext_id[len - 1 - p]) is_palindrome = false;
+            }
+            if (is_palindrome) {
+                has_pattern = true;
+            }
+        }
+    }
+
+    // If we found a pattern, record it
+    if (has_pattern) {
+        uint match_idx = atomic_fetch_add_explicit(match_count, 1, memory_order_relaxed);
+        if (match_idx < 500000000) {
+            matches[match_idx].prime_idx_p = i;
+            matches[match_idx].prime_idx_q = j;
+            for (uint k = 0; k < 32; k++) {
+                matches[match_idx].ext_id[k] = ext_id[k];
+            }
+            matches[match_idx].ext_id[32] = '\0';
+            matches[match_idx].match_type = 4;  // 4 = pattern match
+        }
+        return;  // Found a pattern, done with this ID
+    }
+
+    // =========================================================================
     // Check against dictionary (prefix and suffix)
+    // =========================================================================
     for (uint w = 0; w < num_words; w++) {
         uint word_start = word_offsets[w];
         uint word_end = word_offsets[w + 1];
         uint word_len = word_end - word_start - 1;  // -1 for null terminator
-        
+
         if (word_len < min_len) continue;
-        
+
         // Check prefix
         bool prefix_match = true;
         for (uint c = 0; c < word_len && prefix_match; c++) {
@@ -449,7 +527,7 @@ kernel void vanity_search_dict(
                 prefix_match = false;
             }
         }
-        
+
         // Check suffix
         bool suffix_match = true;
         uint suffix_start = 32 - word_len;
@@ -458,10 +536,10 @@ kernel void vanity_search_dict(
                 suffix_match = false;
             }
         }
-        
+
         if (prefix_match || suffix_match) {
             uint match_idx = atomic_fetch_add_explicit(match_count, 1, memory_order_relaxed);
-            if (match_idx < 10000000) {  // 10M limit to match CPU buffer
+            if (match_idx < 500000000) {  // 500M limit to match CPU buffer
                 matches[match_idx].prime_idx_p = i;
                 matches[match_idx].prime_idx_q = j;
                 for (uint k = 0; k < 32; k++) {

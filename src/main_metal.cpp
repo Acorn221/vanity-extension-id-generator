@@ -582,10 +582,47 @@ int main(int argc, char* argv[]) {
 
         std::string ext_id = gpu_match.extension_id;
         
-        // Check dictionary matches
+        // Check what type of match the GPU found
+        // match_type: 1=prefix, 2=suffix, 3=both, 4=pattern
+        uint32_t match_type = gpu_match.match_type;
+
         std::vector<std::pair<std::string, std::string>> word_matches;
-        if (use_dictionary) {
-            word_matches = check_dictionary_cpu(ext_id, dict);
+
+        if (match_type == 4) {
+            // GPU flagged this as a pattern - run full pattern detection
+            std::string cool_pattern = detect_cool_pattern_cpu(ext_id);
+            if (!cool_pattern.empty()) {
+                word_matches.emplace_back("PATTERN", cool_pattern);
+            }
+        } else if (use_dictionary) {
+            // Dictionary match - GPU already validated, just find the word
+            // Check prefix match (type 1 or 3)
+            if (match_type & 1) {
+                // Find which prefix word matches (longest first)
+                for (const auto& word : dict.prefixes) {
+                    if (ext_id.compare(0, word.length(), word) == 0) {
+                        word_matches.emplace_back(word, "start");
+                        break;
+                    }
+                }
+            }
+            // Check suffix match (type 2 or 3)
+            if (match_type & 2) {
+                for (const auto& word : dict.suffixes) {
+                    size_t pos = 32 - word.length();
+                    if (ext_id.compare(pos, word.length(), word) == 0) {
+                        // Avoid duplicate if same word matched both
+                        bool already = false;
+                        for (const auto& m : word_matches) {
+                            if (m.first == word) { already = true; break; }
+                        }
+                        if (!already) {
+                            word_matches.emplace_back(word, "end");
+                        }
+                        break;
+                    }
+                }
+            }
         } else {
             // Single target mode
             if (!target_prefix.empty() && ext_id.compare(0, target_prefix.length(), target_prefix) == 0) {
@@ -598,13 +635,7 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
-        
-        // Check for cool patterns
-        std::string cool_pattern = detect_cool_pattern_cpu(ext_id);
-        if (!cool_pattern.empty()) {
-            word_matches.emplace_back("PATTERN", cool_pattern);
-        }
-        
+
         if (word_matches.empty()) continue;
         
         // Find longest match for limit checking
