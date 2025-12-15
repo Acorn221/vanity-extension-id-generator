@@ -4,12 +4,17 @@
  * Generates a pool of certified 1024-bit primes and stores them in a binary file.
  * These primes are used by the Metal GPU search to try all combinations.
  * 
+ * Supports two backends:
+ *   - Metal GPU (default on macOS): Much faster, uses GPU parallelism
+ *   - CPU (fallback): Uses OpenSSL with multi-threading
+ * 
  * Output format:
- *   - Header: uint32_t count, uint32_t prime_bytes (128)
+ *   - Header: uint32_t magic, version, count, prime_bytes (128)
  *   - Primes: count × 128 bytes (big-endian, zero-padded)
  * 
- * Usage: ./generate_prime_pool [count] [output_file]
+ * Usage: ./generate_prime_pool [count] [output_file] [--cpu]
  *        Default: 100000 primes to prime_pool.bin
+ *        --cpu: Force CPU backend even if Metal is available
  */
 
 #include <iostream>
@@ -25,6 +30,14 @@
 #include <openssl/bn.h>
 #include <openssl/rand.h>
 
+// Metal support (macOS only)
+#ifdef __APPLE__
+#define HAS_METAL 1
+#include "metal/prime_metal_runner.h"
+#else
+#define HAS_METAL 0
+#endif
+
 constexpr size_t PRIME_BITS = 1024;
 constexpr size_t PRIME_BYTES = PRIME_BITS / 8;  // 128 bytes
 
@@ -34,6 +47,10 @@ struct PrimePoolHeader {
     uint32_t count;         // Number of primes
     uint32_t prime_bytes;   // 128
 };
+
+// =============================================================================
+// CPU Backend (OpenSSL)
+// =============================================================================
 
 // Convert BIGNUM to fixed-size big-endian byte array
 bool bn_to_bytes(const BIGNUM* bn, uint8_t* out, size_t out_len) {
@@ -50,8 +67,8 @@ bool bn_to_bytes(const BIGNUM* bn, uint8_t* out, size_t out_len) {
     return true;
 }
 
-// Generate a single 1024-bit prime
-BIGNUM* generate_prime(BN_CTX* ctx) {
+// Generate a single 1024-bit prime using OpenSSL
+BIGNUM* generate_prime_cpu(BN_CTX* /* ctx */) {
     BIGNUM* prime = BN_new();
     if (!prime) return nullptr;
     
@@ -65,8 +82,8 @@ BIGNUM* generate_prime(BN_CTX* ctx) {
     return prime;
 }
 
-// Worker thread for parallel prime generation
-void worker_thread(
+// Worker thread for parallel CPU prime generation
+void cpu_worker_thread(
     std::vector<std::vector<uint8_t>>& primes,
     std::mutex& primes_mutex,
     std::atomic<size_t>& generated,
@@ -77,7 +94,7 @@ void worker_thread(
     std::vector<uint8_t> prime_bytes(PRIME_BYTES);
     
     while (!done.load()) {
-        BIGNUM* prime = generate_prime(ctx);
+        BIGNUM* prime = generate_prime_cpu(ctx);
         if (!prime) continue;
         
         bn_to_bytes(prime, prime_bytes.data(), PRIME_BYTES);
@@ -98,29 +115,14 @@ void worker_thread(
     BN_CTX_free(ctx);
 }
 
-int main(int argc, char* argv[]) {
-    size_t target_count = 100000;
-    std::string output_file = "prime_pool.bin";
-    
-    if (argc > 1) {
-        target_count = std::stoull(argv[1]);
-    }
-    if (argc > 2) {
-        output_file = argv[2];
-    }
-    
-    std::cout << "Prime Pool Generator\n";
-    std::cout << "====================\n";
-    std::cout << "Target count: " << target_count << " primes\n";
-    std::cout << "Prime size:   " << PRIME_BITS << " bits (" << PRIME_BYTES << " bytes)\n";
-    std::cout << "Output file:  " << output_file << "\n";
-    std::cout << "Output size:  ~" << (target_count * PRIME_BYTES / 1024 / 1024) << " MB\n";
-    std::cout << "\n";
+// Generate primes using CPU
+size_t generate_primes_cpu(size_t target_count, const std::string& output_file) {
+    std::cout << "Using CPU backend (OpenSSL)\n";
     
     // Determine thread count
     unsigned int num_threads = std::thread::hardware_concurrency();
     if (num_threads == 0) num_threads = 4;
-    std::cout << "Using " << num_threads << " threads\n\n";
+    std::cout << "Using " << num_threads << " CPU threads\n\n";
     
     // Storage for generated primes
     std::vector<std::vector<uint8_t>> primes;
@@ -134,7 +136,7 @@ int main(int argc, char* argv[]) {
     // Spawn worker threads
     std::vector<std::thread> workers;
     for (unsigned int i = 0; i < num_threads; i++) {
-        workers.emplace_back(worker_thread, 
+        workers.emplace_back(cpu_worker_thread, 
             std::ref(primes), std::ref(primes_mutex),
             std::ref(generated), std::ref(done), target_count);
     }
@@ -187,7 +189,7 @@ int main(int argc, char* argv[]) {
     std::ofstream out(output_file, std::ios::binary);
     if (!out) {
         std::cerr << "Error: Could not open output file\n";
-        return 1;
+        return 0;
     }
     
     // Write header
@@ -207,11 +209,179 @@ int main(int argc, char* argv[]) {
     out.close();
     
     std::cout << "Done! Wrote " << primes.size() << " primes to " << output_file << "\n";
-    std::cout << "File size: " << (sizeof(header) + primes.size() * PRIME_BYTES) << " bytes\n";
     
-    // Print stats
+    return primes.size();
+}
+
+// =============================================================================
+// Metal GPU Backend
+// =============================================================================
+
+#if HAS_METAL
+
+size_t generate_primes_metal(size_t target_count, const std::string& output_file) {
+    std::cout << "Using Metal GPU backend\n\n";
+    
+    vanity::metal::PrimeMetalRunner runner;
+    
+    if (!runner.isAvailable()) {
+        std::cerr << "Metal GPU not available, falling back to CPU\n\n";
+        return generate_primes_cpu(target_count, output_file);
+    }
+    
+    std::cout << "GPU Device: " << runner.getDeviceName() << "\n";
+    std::cout << "Estimated rate: ~" << static_cast<int>(runner.getEstimatedRate()) << " primes/sec\n\n";
+    
+    auto start_time = std::chrono::steady_clock::now();
+    size_t last_count = 0;
+    auto last_time = start_time;
+    
+    // Progress callback
+    auto progress_callback = [&](size_t current, size_t target, double rate) {
+        auto now = std::chrono::steady_clock::now();
+        (void)start_time;  // Used for potential future enhancements
+        
+        double progress = 100.0 * current / target;
+        double eta = (rate > 0) ? (target - current) / rate : 0;
+        
+        // Format ETA nicely for long runs
+        std::string eta_str;
+        if (eta > 3600) {
+            int hours = static_cast<int>(eta / 3600);
+            int mins = static_cast<int>((eta - hours * 3600) / 60);
+            eta_str = std::to_string(hours) + "h " + std::to_string(mins) + "m";
+        } else if (eta > 60) {
+            int mins = static_cast<int>(eta / 60);
+            int secs = static_cast<int>(eta - mins * 60);
+            eta_str = std::to_string(mins) + "m " + std::to_string(secs) + "s";
+        } else {
+            eta_str = std::to_string(static_cast<int>(eta)) + "s";
+        }
+        
+        std::cout << "\rProgress: " << std::setw(10) << current << " / " << target
+                  << " (" << std::fixed << std::setprecision(1) << progress << "%)"
+                  << " | Rate: " << std::setw(6) << static_cast<int>(rate) << "/s"
+                  << " | ETA: " << std::setw(10) << eta_str
+                  << "     " << std::flush;
+        
+        last_count = current;
+        last_time = now;
+    };
+    
+    size_t generated = runner.generatePrimes(target_count, output_file, progress_callback);
+    
+    std::cout << "\n";
+    
+    return generated;
+}
+
+#endif
+
+// =============================================================================
+// Main
+// =============================================================================
+
+void print_usage(const char* prog) {
+    std::cout << "Usage: " << prog << " [count] [output_file] [options]\n";
+    std::cout << "\n";
+    std::cout << "Arguments:\n";
+    std::cout << "  count        Number of primes to generate (default: 100000)\n";
+    std::cout << "  output_file  Output file path (default: prime_pool.bin)\n";
+    std::cout << "\n";
+    std::cout << "Options:\n";
+    std::cout << "  --cpu        Force CPU backend (OpenSSL)\n";
+    std::cout << "  --metal      Force Metal GPU backend (macOS only)\n";
+    std::cout << "  --help       Show this help message\n";
+    std::cout << "\n";
+    std::cout << "Examples:\n";
+    std::cout << "  " << prog << " 50000000 prime_pool_50m.bin\n";
+    std::cout << "  " << prog << " 1000000 --cpu\n";
+}
+
+int main(int argc, char* argv[]) {
+    size_t target_count = 100000;
+    std::string output_file = "prime_pool.bin";
+    bool force_cpu = false;
+    bool force_metal = false;
+    
+    // Parse arguments
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        
+        if (arg == "--cpu") {
+            force_cpu = true;
+        } else if (arg == "--metal") {
+            force_metal = true;
+        } else if (arg == "--help" || arg == "-h") {
+            print_usage(argv[0]);
+            return 0;
+        } else if (arg[0] != '-') {
+            // Positional argument
+            if (i == 1 || (i == 2 && !force_cpu && !force_metal)) {
+                // Try to parse as count first
+                try {
+                    size_t val = std::stoull(arg);
+                    if (target_count == 100000) {
+                        target_count = val;
+                    } else {
+                        output_file = arg;
+                    }
+                } catch (...) {
+                    output_file = arg;
+                }
+            } else {
+                output_file = arg;
+            }
+        }
+    }
+    
+    std::cout << "Prime Pool Generator\n";
+    std::cout << "====================\n";
+    std::cout << "Target count: " << target_count << " primes\n";
+    std::cout << "Prime size:   " << PRIME_BITS << " bits (" << PRIME_BYTES << " bytes)\n";
+    std::cout << "Output file:  " << output_file << "\n";
+    
+    // Calculate expected file size
+    size_t expected_size = sizeof(PrimePoolHeader) + target_count * PRIME_BYTES;
+    if (expected_size > 1024 * 1024 * 1024) {
+        std::cout << "Output size:  ~" << (expected_size / 1024 / 1024 / 1024) << " GB\n";
+    } else {
+        std::cout << "Output size:  ~" << (expected_size / 1024 / 1024) << " MB\n";
+    }
+    std::cout << "\n";
+    
+    size_t generated = 0;
+    
+#if HAS_METAL
+    if (!force_cpu) {
+        generated = generate_primes_metal(target_count, output_file);
+    } else {
+        generated = generate_primes_cpu(target_count, output_file);
+    }
+#else
+    if (force_metal) {
+        std::cerr << "Error: Metal is only available on macOS\n";
+        return 1;
+    }
+    generated = generate_primes_cpu(target_count, output_file);
+#endif
+    
+    if (generated == 0) {
+        std::cerr << "Error: Failed to generate primes\n";
+        return 1;
+    }
+    
+    // Print final stats
+    std::cout << "\nFile size: " << (sizeof(PrimePoolHeader) + generated * PRIME_BYTES) << " bytes\n";
     std::cout << "\nPool statistics:\n";
-    std::cout << "  Total combinations: " << (primes.size() * (primes.size() - 1) / 2) << " unique keys\n";
+    std::cout << "  Total primes: " << generated << "\n";
+    std::cout << "  Total combinations: " << (generated * (generated - 1) / 2) << " unique keys\n";
+    
+    // Estimate search time
+    double pairs = static_cast<double>(generated) * (generated - 1) / 2;
+    std::cout << "\nEstimated vanity search times (at 100M pairs/sec):\n";
+    std::cout << "  Full search: " << std::fixed << std::setprecision(1) 
+              << (pairs / 100e6 / 60) << " minutes\n";
     
     return 0;
 }
