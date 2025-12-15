@@ -1,2 +1,4 @@
-.cache
-build
+vanity-ext-id-cpu/build
+vanity-ext-id-metal/build
+vanity-ext-id-cpu/cache
+vanity-ext-id-metal/cache
