@@ -302,6 +302,25 @@ __device__ uint32_t count_ai_occurrences(const char* ext_id) {
     return count;
 }
 
+// Find longest run of duplicate characters
+__device__ uint32_t find_max_char_run(const char* ext_id) {
+    uint32_t max_run = 1;
+    uint32_t current_run = 1;
+    
+    #pragma unroll 31
+    for (uint32_t i = 1; i < 32; i++) {
+        if (ext_id[i] == ext_id[i - 1]) {
+            current_run++;
+            if (current_run > max_run) {
+                max_run = current_run;
+            }
+        } else {
+            current_run = 1;
+        }
+    }
+    return max_run;
+}
+
 // =============================================================================
 // Main Search Kernel
 // =============================================================================
@@ -634,8 +653,12 @@ extern "C" __global__ void __launch_bounds__(BLOCK_SIZE, MAX_BLOCKS_PER_SM) vani
     // Count "ai" occurrences
     uint32_t ai_count = count_ai_occurrences(ext_id);
     
-    // Only save if we have enough "ai" occurrences
-    if (ai_count >= min_ai_count) {
+    // Check for duplicate character runs (10+)
+    uint32_t max_run = find_max_char_run(ext_id);
+    
+    // Save if we have enough "ai" occurrences OR a long duplicate run
+    // match_type encoding: bits 0-7 = ai_count, bits 8-15 = max_run
+    if (ai_count >= min_ai_count || max_run >= 10) {
         uint32_t match_idx = atomicAdd(match_count, 1);
         
         if (match_idx < max_matches) {
@@ -646,7 +669,8 @@ extern "C" __global__ void __launch_bounds__(BLOCK_SIZE, MAX_BLOCKS_PER_SM) vani
                 matches[match_idx].ext_id[k] = ext_id[k];
             }
             matches[match_idx].ext_id[32] = '\0';
-            matches[match_idx].match_type = ai_count;  // Store the count as match_type
+            // Encode both values: ai_count in low byte, max_run in high byte
+            matches[match_idx].match_type = ai_count | (max_run << 8);
         }
     }
 }

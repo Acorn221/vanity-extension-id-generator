@@ -59,7 +59,7 @@ void print_usage(const char* prog_name) {
               << "  -d, --dict FILE     Search for words from dictionary file\n"
               << "  -s, --start STR     Find IDs starting with STR\n"
               << "  -e, --end STR       Find IDs ending with STR\n"
-              << "  --ai N              Fast AI mode: find IDs with N+ 'ai' occurrences (GPU-only)\n\n"
+              << "  --ai N              Fast AI mode: find IDs with N+ 'ai' OR 10+ duplicate chars (GPU-only)\n\n"
               << "Output Options:\n"
               << "  -o, --output FILE   Output CSV file (default: cuda_results.csv)\n"
               << "  --min-len N         Minimum word length for dictionary (default: 3)\n"
@@ -441,7 +441,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Total Pairs:    " << format_number(totalPairs) << " unique keys\n";
     
     if (ai_mode_count > 0) {
-        std::cout << "Search Mode:    FAST AI MODE (" << ai_mode_count << "+ 'ai' occurrences)\n";
+        std::cout << "Search Mode:    FAST AI MODE (" << ai_mode_count << "+ 'ai' OR 10+ char runs)\n";
         std::cout << "                GPU-only, no CPU processing!\n";
     } else if (use_dictionary) {
         std::cout << "Dictionary:     " << dict_file << " (" << dict.size() << " words)\n";
@@ -534,9 +534,23 @@ int main(int argc, char* argv[]) {
                 validated_count++;
             }
             
-            // Write directly: ext_id,ai_count,p_idx,q_idx,validated
+            // Decode match_type: low byte = ai_count, high byte = max_run
+            uint32_t ai_count = match.match_type & 0xFF;
+            uint32_t max_run = (match.match_type >> 8) & 0xFF;
+            
+            // Build match description
+            std::string match_desc;
+            if (ai_count >= ai_mode_count) {
+                match_desc += "ai*" + std::to_string(ai_count);
+            }
+            if (max_run >= 10) {
+                if (!match_desc.empty()) match_desc += ",";
+                match_desc += "run*" + std::to_string(max_run);
+            }
+            
+            // Write: ext_id,matches,p_idx,q_idx,validated
             csv_out << match.extension_id << ","
-                    << "ai*" << match.match_type << ","  // match_type contains AI count
+                    << match_desc << ","
                     << match.prime_idx_p << ","
                     << match.prime_idx_q << ","
                     << (validate_primes ? "true" : "false") << "\n";
