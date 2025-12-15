@@ -58,7 +58,8 @@ void print_usage(const char* prog_name) {
               << "Search Options:\n"
               << "  -d, --dict FILE     Search for words from dictionary file\n"
               << "  -s, --start STR     Find IDs starting with STR\n"
-              << "  -e, --end STR       Find IDs ending with STR\n\n"
+              << "  -e, --end STR       Find IDs ending with STR\n"
+              << "  --ai N              Fast AI mode: find IDs with N+ 'ai' occurrences (GPU-only)\n\n"
               << "Output Options:\n"
               << "  -o, --output FILE   Output CSV file (default: cuda_results.csv)\n"
               << "  --min-len N         Minimum word length for dictionary (default: 3)\n"
@@ -69,6 +70,7 @@ void print_usage(const char* prog_name) {
               << "Other Options:\n"
               << "  -h, --help          Show this help message\n\n"
               << "Examples:\n"
+              << "  " << prog_name << " -p pool.bin --ai 7 -o ai_results.csv  # Fast AI mode!\n"
               << "  " << prog_name << " -p pool.bin -d wordlist.txt -o results.csv --validate\n"
               << "  " << prog_name << " -p pool.bin -s cafe\n"
               << "  " << prog_name << " -p pool.bin -s cia -e fbi\n\n"
@@ -315,6 +317,7 @@ int main(int argc, char* argv[]) {
     size_t min_word_len = 3;
     size_t max_word_len = 10;
     bool validate_primes = true;  // Default to validation for safety
+    uint32_t ai_mode_count = 0;   // 0 = disabled, N = find IDs with N+ "ai" occurrences
     
     // Parse arguments
     for (int i = 1; i < argc; i++) {
@@ -348,6 +351,9 @@ int main(int argc, char* argv[]) {
             validate_primes = true;
         } else if (arg == "--no-validate") {
             validate_primes = false;
+        } else if (arg == "--ai") {
+            if (i + 1 >= argc) { std::cerr << "Error: --ai requires a number\n"; return 1; }
+            ai_mode_count = std::stoul(argv[++i]);
         } else {
             std::cerr << "Error: Unknown option: " << arg << "\n";
             return 1;
@@ -361,8 +367,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    if (target_prefix.empty() && target_suffix.empty() && dict_file.empty()) {
-        std::cerr << "Error: Need at least one of -s, -e, or -d\n";
+    if (target_prefix.empty() && target_suffix.empty() && dict_file.empty() && ai_mode_count == 0) {
+        std::cerr << "Error: Need at least one of -s, -e, -d, or --ai\n";
         return 1;
     }
     
@@ -434,14 +440,19 @@ int main(int argc, char* argv[]) {
     std::cout << "Prime Pool:     " << format_number(primeCount) << " primes\n";
     std::cout << "Total Pairs:    " << format_number(totalPairs) << " unique keys\n";
     
-    if (use_dictionary) {
+    if (ai_mode_count > 0) {
+        std::cout << "Search Mode:    FAST AI MODE (" << ai_mode_count << "+ 'ai' occurrences)\n";
+        std::cout << "                GPU-only, no CPU processing!\n";
+    } else if (use_dictionary) {
         std::cout << "Dictionary:     " << dict_file << " (" << dict.size() << " words)\n";
         std::cout << "Word Length:    " << min_word_len << "-" << max_word_len << " chars\n";
     }
     if (!target_prefix.empty()) std::cout << "Target Prefix:  \"" << target_prefix << "\"\n";
     if (!target_suffix.empty()) std::cout << "Target Suffix:  \"" << target_suffix << "\"\n";
     std::cout << "Output File:    " << output_file << "\n";
-    std::cout << "Validation:     " << (validate_primes ? "ENABLED (Miller-Rabin)" : "DISABLED") << "\n";
+    if (ai_mode_count == 0) {
+        std::cout << "Validation:     " << (validate_primes ? "ENABLED (Miller-Rabin)" : "DISABLED") << "\n";
+    }
     if (resumed) {
         std::cout << "RESUMED:        " << format_number(state.total_pairs_checked) 
                   << " pairs, " << state.total_matches << " matches\n";
@@ -498,17 +509,57 @@ int main(int argc, char* argv[]) {
     
     // Run GPU search
     std::vector<GPUMatch> gpu_results;
-    if (use_dictionary) {
-        gpu_results = runner.searchDictionary(targets, min_word_len, progress_callback);
+    
+    if (ai_mode_count > 0) {
+        // Fast AI mode - GPU only!
+        gpu_results = runner.searchAI(ai_mode_count, progress_callback);
+        
+        if (g_interrupted) {
+            std::cout << "\nSearch interrupted by user.\n";
+        }
+        
+        // Direct output - no CPU processing needed!
+        std::cout << "\n\nWriting " << gpu_results.size() << " AI matches directly to CSV...\n";
+        
+        // Optionally validate if requested
+        const uint8_t* prime_pool_ptr = validate_primes ? runner.getPrimePool() : nullptr;
+        
+        for (const auto& match : gpu_results) {
+            // Validate if enabled
+            if (validate_primes) {
+                if (!validatePrimePair(prime_pool_ptr, match.prime_idx_p, match.prime_idx_q)) {
+                    invalid_count++;
+                    continue;
+                }
+                validated_count++;
+            }
+            
+            // Write directly: ext_id,ai_count,p_idx,q_idx,validated
+            csv_out << match.extension_id << ","
+                    << "ai*" << match.match_type << ","  // match_type contains AI count
+                    << match.prime_idx_p << ","
+                    << match.prime_idx_q << ","
+                    << (validate_primes ? "true" : "false") << "\n";
+            
+            matches_found++;
+        }
+        
+        csv_out.flush();
+        csv_out.close();
+        
     } else {
-        gpu_results = runner.search(search_config, progress_callback);
-    }
-    
-    if (g_interrupted) {
-        std::cout << "\nSearch interrupted by user.\n";
-    }
-    
-    // Process GPU results on CPU
+        // Standard search modes
+        if (use_dictionary) {
+            gpu_results = runner.searchDictionary(targets, min_word_len, progress_callback);
+        } else {
+            gpu_results = runner.search(search_config, progress_callback);
+        }
+        
+        if (g_interrupted) {
+            std::cout << "\nSearch interrupted by user.\n";
+        }
+        
+        // Process GPU results on CPU
     std::cout << "\n\nProcessing " << gpu_results.size() << " GPU matches...\n";
     if (validate_primes) {
         std::cout << "Validating primes (this may take a while for large result sets)...\n";
@@ -638,6 +689,7 @@ int main(int argc, char* argv[]) {
     
     csv_out.flush();
     csv_out.close();
+    }  // End of else block for non-AI mode
     
     // Update and save state
     state.total_pairs_checked = runner.getTotalPairs();
@@ -660,7 +712,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Total Time:        " << format_time(total_time) << "\n";
     std::cout << "Avg Rate:          " << format_number(static_cast<uint64_t>(runner.getTotalPairs() / total_time)) << " pairs/s\n";
     std::cout << "GPU Matches:       " << gpu_results.size() << "\n";
-    if (validate_primes) {
+    if (validate_primes && (validated_count + invalid_count) > 0) {
         std::cout << "Validated:         " << validated_count << " (" 
                   << std::fixed << std::setprecision(1) 
                   << (100.0 * validated_count / (validated_count + invalid_count)) << "%)\n";

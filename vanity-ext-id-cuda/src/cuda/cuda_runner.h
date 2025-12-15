@@ -121,6 +121,19 @@ public:
     );
     
     /**
+     * Fast "AI" search - finds extension IDs with N+ occurrences of "ai"
+     * This is GPU-only with no CPU post-processing needed.
+     * 
+     * @param min_ai_count Minimum number of "ai" occurrences to save (e.g., 7)
+     * @param callback Progress callback
+     * @return Vector of matches found (match_type contains the ai count)
+     */
+    std::vector<GPUMatch> searchAI(
+        uint32_t min_ai_count,
+        ProgressCallback callback = nullptr
+    );
+    
+    /**
      * Stop any running search
      */
     void stop();

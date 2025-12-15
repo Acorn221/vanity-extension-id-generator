@@ -103,6 +103,14 @@ extern "C" __global__ void vanity_search_dict_kernel(
     uint32_t max_matches
 );
 
+extern "C" __global__ void vanity_search_ai_kernel(
+    const uint8_t* prime_pool,
+    const uint32_t* params,
+    uint32_t* match_count,
+    ShaderMatchResult* matches,
+    uint32_t max_matches
+);
+
 // =============================================================================
 // Per-GPU Context
 // =============================================================================
@@ -631,6 +639,151 @@ public:
         return results;
     }
     
+    std::vector<GPUMatch> searchAI(uint32_t min_ai_count, ProgressCallback callback) {
+        std::vector<GPUMatch> results;
+        
+        if (!isAvailable() || prime_count_ == 0) {
+            return results;
+        }
+        
+        running_ = true;
+        stop_requested_ = false;
+        
+        std::cout << "CUDA: Fast AI search mode - looking for " << min_ai_count << "+ 'ai' occurrences\n";
+        
+        // Allocate buffers on each GPU - simpler than dictionary mode
+        size_t max_matches_per_gpu = 100000000;  // 100M per GPU - AI matches are rarer
+        
+        for (auto& ctx : gpu_contexts_) {
+            cudaSetDevice(ctx.device_id);
+            
+            ctx.max_matches = max_matches_per_gpu;
+            
+            // Only need params, match_count, and matches buffers
+            cudaMalloc(&ctx.d_params, 4 * sizeof(uint32_t));
+            cudaMalloc(&ctx.d_match_count, sizeof(uint32_t));
+            cudaMalloc(&ctx.d_matches, max_matches_per_gpu * sizeof(ShaderMatchResult));
+            
+            // Allocate pinned host memory
+            cudaMallocHost(&ctx.h_match_count, sizeof(uint32_t));
+            cudaMallocHost(&ctx.h_matches, max_matches_per_gpu * sizeof(ShaderMatchResult));
+            
+            // Initialize match count to 0
+            cudaMemset(ctx.d_match_count, 0, sizeof(uint32_t));
+        }
+        
+        uint64_t total_pairs = (uint64_t)prime_count_ * (prime_count_ - 1) / 2;
+        uint32_t batch_size = 4096;  // Larger batches for simpler kernel
+        
+        auto start_time = std::chrono::steady_clock::now();
+        
+        // Process in batches across all GPUs
+        for (uint32_t batch_start = 0; batch_start < prime_count_ && !stop_requested_; batch_start += batch_size * device_count_) {
+            // Launch kernels on all GPUs
+            for (int gpu_idx = 0; gpu_idx < device_count_; gpu_idx++) {
+                auto& ctx = gpu_contexts_[gpu_idx];
+                cudaSetDevice(ctx.device_id);
+                
+                uint32_t start_idx = batch_start + gpu_idx * batch_size;
+                if (start_idx >= prime_count_) continue;
+                
+                // Update params: [pool_size, min_ai_count, 0, start_idx]
+                uint32_t params[4] = {
+                    static_cast<uint32_t>(prime_count_),
+                    min_ai_count,
+                    0,
+                    start_idx
+                };
+                cudaMemcpyAsync(ctx.d_params, params, sizeof(params),
+                               cudaMemcpyHostToDevice, ctx.stream);
+                
+                // Calculate grid dimensions
+                uint32_t grid_width = min(batch_size, (uint32_t)prime_count_ - start_idx);
+                uint32_t grid_height = prime_count_ - start_idx;
+                
+                // A100 optimal: 256 threads per block
+                dim3 block_size(16, 16);
+                dim3 grid_size((grid_width + block_size.x - 1) / block_size.x,
+                              (grid_height + block_size.y - 1) / block_size.y);
+                
+                // Launch the fast AI kernel
+                vanity_search_ai_kernel<<<grid_size, block_size, 0, ctx.stream>>>(
+                    ctx.d_prime_pool,
+                    ctx.d_params,
+                    ctx.d_match_count,
+                    ctx.d_matches,
+                    ctx.max_matches
+                );
+            }
+            
+            // Synchronize all GPUs
+            for (auto& ctx : gpu_contexts_) {
+                cudaSetDevice(ctx.device_id);
+                cudaStreamSynchronize(ctx.stream);
+            }
+            
+            // Progress callback
+            if (callback) {
+                uint64_t pairs_checked = 0;
+                uint64_t total_matches = 0;
+                
+                for (auto& ctx : gpu_contexts_) {
+                    cudaSetDevice(ctx.device_id);
+                    cudaMemcpy(ctx.h_match_count, ctx.d_match_count, sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost);
+                    total_matches += *ctx.h_match_count;
+                }
+                
+                uint32_t end_idx = min(batch_start + batch_size * device_count_, (uint32_t)prime_count_);
+                for (uint32_t row = 0; row < end_idx; row++) {
+                    pairs_checked += (prime_count_ - 1 - row);
+                }
+                
+                callback(pairs_checked, total_pairs, total_matches);
+            }
+        }
+        
+        // Collect results from all GPUs
+        std::cout << "\nCUDA: Collecting AI matches from " << device_count_ << " GPU(s)...\n";
+        
+        for (auto& ctx : gpu_contexts_) {
+            cudaSetDevice(ctx.device_id);
+            
+            cudaMemcpy(ctx.h_match_count, ctx.d_match_count, sizeof(uint32_t),
+                      cudaMemcpyDeviceToHost);
+            
+            uint32_t match_count = *ctx.h_match_count;
+            if (match_count > ctx.max_matches) match_count = ctx.max_matches;
+            
+            if (match_count > 0) {
+                cudaMemcpy(ctx.h_matches, ctx.d_matches,
+                          match_count * sizeof(ShaderMatchResult),
+                          cudaMemcpyDeviceToHost);
+                
+                for (uint32_t i = 0; i < match_count; i++) {
+                    GPUMatch match;
+                    match.prime_idx_p = ctx.h_matches[i].prime_idx_p;
+                    match.prime_idx_q = ctx.h_matches[i].prime_idx_q;
+                    match.extension_id = std::string(ctx.h_matches[i].ext_id);
+                    match.match_type = ctx.h_matches[i].match_type;  // This is the AI count
+                    results.push_back(match);
+                }
+            }
+            
+            std::cout << "  GPU " << ctx.device_id << ": " << match_count << " matches\n";
+        }
+        
+        auto end_time = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(end_time - start_time).count();
+        
+        std::cout << "CUDA: AI search complete. " << total_pairs << " pairs in "
+                  << elapsed << "s (" << (total_pairs / elapsed / 1e6) << "M pairs/s)\n";
+        std::cout << "Found " << results.size() << " extension IDs with " << min_ai_count << "+ 'ai' occurrences\n";
+        
+        running_ = false;
+        return results;
+    }
+    
     void stop() {
         stop_requested_ = true;
     }
@@ -693,6 +846,10 @@ std::vector<GPUMatch> CudaRunner::searchDictionary(
     ProgressCallback callback
 ) {
     return impl_->searchDictionary(words, min_len, callback);
+}
+
+std::vector<GPUMatch> CudaRunner::searchAI(uint32_t min_ai_count, ProgressCallback callback) {
+    return impl_->searchAI(min_ai_count, callback);
 }
 
 void CudaRunner::stop() {

@@ -55,6 +55,20 @@ make -j$(nproc)
 ./vanity-ext-id-cuda -p prime_pool_100m.bin -d wordlist.txt -o results.csv --validate
 ```
 
+### Fast AI Mode (Recommended!)
+
+The fastest mode - GPU-only with no CPU post-processing:
+
+```bash
+# Find extension IDs with 7+ occurrences of "ai"
+./vanity-ext-id-cuda -p prime_pool_100m.bin --ai 7 -o ai_results.csv
+
+# With validation (slightly slower but filters invalid primes)
+./vanity-ext-id-cuda -p prime_pool_100m.bin --ai 7 -o ai_results.csv --validate
+```
+
+This mode achieved ~100M pairs/s on Mac M1 - expect even better on A100!
+
 ### Options
 
 ```
@@ -65,6 +79,7 @@ Search Options:
   -d, --dict FILE     Search for words from dictionary file
   -s, --start STR     Find IDs starting with STR
   -e, --end STR       Find IDs ending with STR
+  --ai N              Fast AI mode: find IDs with N+ 'ai' occurrences (GPU-only!)
 
 Output Options:
   -o, --output FILE   Output CSV file (default: cuda_results.csv)

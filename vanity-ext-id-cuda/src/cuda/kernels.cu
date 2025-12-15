@@ -290,6 +290,18 @@ __device__ bool check_suffix(const char* ext_id, const char* target, uint32_t ta
     return true;
 }
 
+// Count occurrences of "ai" in extension ID
+__device__ uint32_t count_ai_occurrences(const char* ext_id) {
+    uint32_t count = 0;
+    #pragma unroll 31
+    for (uint32_t i = 0; i < 31; i++) {
+        if (ext_id[i] == 'a' && ext_id[i + 1] == 'i') {
+            count++;
+        }
+    }
+    return count;
+}
+
 // =============================================================================
 // Main Search Kernel
 // =============================================================================
@@ -554,6 +566,87 @@ extern "C" __global__ void __launch_bounds__(BLOCK_SIZE, MAX_BLOCKS_PER_SM) vani
                 matches[match_idx].match_type = (prefix_match ? 1 : 0) | (suffix_match ? 2 : 0);
             }
             return;  // Found a match, don't need to check more words
+        }
+    }
+}
+
+// =============================================================================
+// Fast "AI" Search Kernel - GPU-only, no CPU post-processing needed
+// =============================================================================
+
+extern "C" __global__ void __launch_bounds__(BLOCK_SIZE, MAX_BLOCKS_PER_SM) vanity_search_ai_kernel(
+    const uint8_t* __restrict__ prime_pool,
+    const uint32_t* __restrict__ params,          // [pool_size, min_ai_count, 0, start_idx]
+    uint32_t* __restrict__ match_count,
+    MatchResult* __restrict__ matches,
+    uint32_t max_matches
+) {
+    uint32_t pool_size = params[0];
+    uint32_t min_ai_count = params[1];  // Minimum "ai" occurrences to save (e.g., 7)
+    uint32_t start_idx = params[3];
+    
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x + start_idx;
+    uint32_t j = blockIdx.y * blockDim.y + threadIdx.y + i + 1;
+    
+    if (i >= pool_size || j >= pool_size) return;
+    
+    // Load primes using __ldg for L2 cache optimization
+    const uint8_t* p_bytes = prime_pool + i * PRIME_BYTES;
+    const uint8_t* q_bytes = prime_pool + j * PRIME_BYTES;
+    
+    uint32_t p_words[PRIME_WORDS];
+    uint32_t q_words[PRIME_WORDS];
+    
+    #pragma unroll 8
+    for (uint32_t w = 0; w < PRIME_WORDS; w++) {
+        uint32_t byte_idx = (PRIME_WORDS - 1 - w) * 4;
+        p_words[w] = (__ldg(&p_bytes[byte_idx]) << 24) |
+                     (__ldg(&p_bytes[byte_idx + 1]) << 16) |
+                     (__ldg(&p_bytes[byte_idx + 2]) << 8) |
+                     __ldg(&p_bytes[byte_idx + 3]);
+        q_words[w] = (__ldg(&q_bytes[byte_idx]) << 24) |
+                     (__ldg(&q_bytes[byte_idx + 1]) << 16) |
+                     (__ldg(&q_bytes[byte_idx + 2]) << 8) |
+                     __ldg(&q_bytes[byte_idx + 3]);
+    }
+    
+    // Multiply: n = p × q
+    uint32_t n_words[MODULUS_WORDS];
+    bigint_mul_1024(p_words, q_words, n_words);
+    
+    // Build DER-encoded public key
+    uint8_t der_pubkey[DER_TOTAL_LEN];
+    build_der_pubkey(n_words, der_pubkey);
+    
+    // Compute SHA-256 hash
+    uint8_t hash[32];
+    sha256_der(der_pubkey, DER_TOTAL_LEN, hash);
+    
+    // Convert to extension ID
+    char ext_id[33];
+    #pragma unroll
+    for (uint32_t k = 0; k < 16; k++) {
+        ext_id[k*2] = 'a' + (hash[k] >> 4);
+        ext_id[k*2+1] = 'a' + (hash[k] & 0x0F);
+    }
+    ext_id[32] = '\0';
+    
+    // Count "ai" occurrences
+    uint32_t ai_count = count_ai_occurrences(ext_id);
+    
+    // Only save if we have enough "ai" occurrences
+    if (ai_count >= min_ai_count) {
+        uint32_t match_idx = atomicAdd(match_count, 1);
+        
+        if (match_idx < max_matches) {
+            matches[match_idx].prime_idx_p = i;
+            matches[match_idx].prime_idx_q = j;
+            #pragma unroll
+            for (uint32_t k = 0; k < 32; k++) {
+                matches[match_idx].ext_id[k] = ext_id[k];
+            }
+            matches[match_idx].ext_id[32] = '\0';
+            matches[match_idx].match_type = ai_count;  // Store the count as match_type
         }
     }
 }
