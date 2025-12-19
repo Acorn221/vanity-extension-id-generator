@@ -1,0 +1,68 @@
+{
+	"name": "vitamin",
+	"type": "module",
+	"license": "MIT",
+	"private": true,
+	"version": "0.0.0",
+	"scripts": {
+		"dev": "vite --open",
+		"test": "vitest",
+		"test:e2e": "playwright test --ui",
+		"test:ci": "vitest run",
+		"test:e2e:ci": "playwright test",
+		"lint:tsc": "tsc -b",
+		"lint:biome": "biome check --write --unsafe",
+		"lint": "pnpm run \"/lint:./\"",
+		"format": "biome format --write",
+		"validate": "pnpm lint && pnpm test:ci && pnpm test:e2e:ci",
+		"build": "vite build",
+		"preview": "vite preview"
+	},
+	"dependencies": {
+		"@tanstack/react-query": "5.90.10",
+		"@tanstack/react-query-devtools": "5.91.0",
+		"react": "19.2.0",
+		"react-dom": "19.2.0",
+		"react-error-boundary": "6.0.0",
+		"react-router": "7.9.6",
+		"valibot": "1.1.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.3.7",
+		"@playwright/test": "1.56.1",
+		"@tailwindcss/vite": "4.1.17",
+		"@testing-library/dom": "10.4.1",
+		"@testing-library/jest-dom": "6.9.1",
+		"@testing-library/react": "16.3.0",
+		"@testing-library/user-event": "14.6.1",
+		"@types/node": "24.10.1",
+		"@types/react": "19.2.6",
+		"@types/react-dom": "19.2.3",
+		"@vitejs/plugin-react": "5.1.1",
+		"@vitest/coverage-v8": "4.0.13",
+		"@webgpu/types": "^0.1.68",
+		"happy-dom": "20.0.10",
+		"msw": "2.12.3",
+		"tailwindcss": "4.1.17",
+		"typescript": "5.9.3",
+		"vite": "7.2.4",
+		"vitest": "4.0.13"
+	},
+	"pnpm": {
+		"ignoredBuiltDependencies": [
+			"cypress"
+		],
+		"onlyBuiltDependencies": [
+			"@biomejs/biome",
+			"@tailwindcss/oxide",
+			"esbuild",
+			"msw"
+		]
+	},
+	"packageManager": "pnpm@10.11.1",
+	"msw": {
+		"workerDirectory": [
+			"public"
+		]
+	}
+}
