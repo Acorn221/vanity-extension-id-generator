@@ -1,5 +1,6 @@
 import {useSuspenseQuery} from '@tanstack/react-query'
 import {getFruits} from '@/api/fruits'
+import {CrashButton} from '@/components/CrashButton'
 import {Fruit} from '@/components/Fruit'
 import {Head} from '@/components/Head'
 
@@ -17,6 +18,7 @@ export function Gallery() {
 					<Fruit fruit={fruit} index={index} key={`FruitCard-${fruit.name}`} />
 				))}
 			</div>
+			<CrashButton />
 		</>
 	)
 }
