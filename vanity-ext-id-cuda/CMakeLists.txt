@@ -15,10 +15,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(CUDAToolkit REQUIRED)
 
 # A100 = sm_80, also support sm_86 (RTX 30xx) and sm_89 (RTX 40xx) for testing
-set(CMAKE_CUDA_ARCHITECTURES "80;86;89")
+# GTX 1070 = sm_61
+set(CMAKE_CUDA_ARCHITECTURES "61")
 
 # CUDA compiler flags
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr --allow-unsupported-compiler")
 set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -O3 --use_fast_math")
 
 message(STATUS "CUDA Toolkit version: ${CUDAToolkit_VERSION}")
