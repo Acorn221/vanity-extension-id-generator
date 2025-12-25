@@ -90,21 +90,77 @@ else()
 endif()
 
 # =============================================================================
-# Prime Pool Generator Tool
+# Prime Pool Generator Tool (with Metal GPU acceleration)
 # =============================================================================
 
-add_executable(generate-prime-pool tools/generate_prime_pool.cpp)
-
-target_link_libraries(generate-prime-pool PRIVATE
-    OpenSSL::Crypto
-    Threads::Threads
-)
-
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    target_compile_options(generate-prime-pool PRIVATE -O3 -DNDEBUG)
+if(APPLE AND METAL_FRAMEWORK AND FOUNDATION_FRAMEWORK)
+    # Metal-accelerated prime generator
+    set(PRIME_POOL_SOURCES
+        tools/generate_prime_pool.cpp
+        src/metal/prime_metal_runner.mm
+    )
+    
+    add_executable(generate-prime-pool ${PRIME_POOL_SOURCES})
+    
+    target_include_directories(generate-prime-pool PRIVATE src src/metal)
+    
+    target_link_libraries(generate-prime-pool PRIVATE
+        OpenSSL::Crypto
+        Threads::Threads
+        ${METAL_FRAMEWORK}
+        ${FOUNDATION_FRAMEWORK}
+    )
+    
+    # Objective-C++ settings for Metal runner
+    set_source_files_properties(src/metal/prime_metal_runner.mm PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc"
+    )
+    
+    # Copy Metal shaders for prime generator
+    add_custom_command(TARGET generate-prime-pool POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_SOURCE_DIR}/src/metal
+            ${CMAKE_BINARY_DIR}/metal
+        COMMENT "Copying Metal shaders for prime generator"
+    )
+    
+    if(CMAKE_BUILD_TYPE STREQUAL "Release")
+        if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+            target_compile_options(generate-prime-pool PRIVATE
+                -O3
+                -mcpu=apple-m1
+                -mtune=native
+                -flto=auto
+                -ffast-math
+                -funroll-loops
+                -DNDEBUG
+            )
+        else()
+            target_compile_options(generate-prime-pool PRIVATE -O3 -DNDEBUG)
+        endif()
+        target_link_options(generate-prime-pool PRIVATE -flto=auto)
+    endif()
+    
+    target_compile_options(generate-prime-pool PRIVATE -Wall -Wextra)
+    
+    message(STATUS "Prime Pool Generator: Metal GPU acceleration enabled")
+else()
+    # CPU-only prime generator (non-Apple platforms)
+    add_executable(generate-prime-pool tools/generate_prime_pool.cpp)
+    
+    target_link_libraries(generate-prime-pool PRIVATE
+        OpenSSL::Crypto
+        Threads::Threads
+    )
+    
+    if(CMAKE_BUILD_TYPE STREQUAL "Release")
+        target_compile_options(generate-prime-pool PRIVATE -O3 -DNDEBUG)
+    endif()
+    
+    target_compile_options(generate-prime-pool PRIVATE -Wall -Wextra)
+    
+    message(STATUS "Prime Pool Generator: CPU-only (no Metal)")
 endif()
-
-target_compile_options(generate-prime-pool PRIVATE -Wall -Wextra)
 
 # =============================================================================
 # Installation
@@ -112,3 +168,54 @@ target_compile_options(generate-prime-pool PRIVATE -Wall -Wextra)
 
 install(TARGETS ${PROJECT_NAME} DESTINATION bin)
 install(TARGETS generate-prime-pool DESTINATION bin)
+
+# =============================================================================
+# Ultra-Fast Prime Generator (CPU optimized, minimal M-R rounds)
+# =============================================================================
+
+add_executable(generate-prime-pool-fast tools/generate_prime_pool_fast.cpp)
+
+target_link_libraries(generate-prime-pool-fast PRIVATE
+    OpenSSL::Crypto
+    Threads::Threads
+)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+        target_compile_options(generate-prime-pool-fast PRIVATE
+            -O3 -mcpu=native -mtune=native -flto -ffast-math -funroll-loops -DNDEBUG
+        )
+    else()
+        target_compile_options(generate-prime-pool-fast PRIVATE
+            -O3 -march=native -mtune=native -flto -ffast-math -funroll-loops -DNDEBUG
+        )
+    endif()
+    target_link_options(generate-prime-pool-fast PRIVATE -flto)
+endif()
+
+target_compile_options(generate-prime-pool-fast PRIVATE -Wall -Wextra)
+install(TARGETS generate-prime-pool-fast DESTINATION bin)
+
+# =============================================================================
+# TURBO Prime Generator (trial division only - maximum speed)
+# =============================================================================
+
+add_executable(generate-prime-pool-turbo tools/generate_prime_pool_turbo.cpp)
+
+target_link_libraries(generate-prime-pool-turbo PRIVATE Threads::Threads)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+        target_compile_options(generate-prime-pool-turbo PRIVATE
+            -O3 -mcpu=native -mtune=native -flto -ffast-math -funroll-loops -DNDEBUG
+        )
+    else()
+        target_compile_options(generate-prime-pool-turbo PRIVATE
+            -O3 -march=native -mtune=native -flto -ffast-math -funroll-loops -DNDEBUG
+        )
+    endif()
+    target_link_options(generate-prime-pool-turbo PRIVATE -flto)
+endif()
+
+target_compile_options(generate-prime-pool-turbo PRIVATE -Wall -Wextra)
+install(TARGETS generate-prime-pool-turbo DESTINATION bin)
