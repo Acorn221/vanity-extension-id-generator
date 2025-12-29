@@ -1,0 +1,3 @@
+[submodule "vanity-ext-id-cuda/CGBN"]
+	path = vanity-ext-id-cuda/CGBN
+	url = https://github.com/NVlabs/CGBN.git

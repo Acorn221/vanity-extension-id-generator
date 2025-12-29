@@ -16,7 +16,8 @@ find_package(CUDAToolkit REQUIRED)
 
 # A100 = sm_80, also support sm_86 (RTX 30xx) and sm_89 (RTX 40xx) for testing
 # GTX 1070 = sm_61
-set(CMAKE_CUDA_ARCHITECTURES "61")
+# RTX 3080 = sm_86
+set(CMAKE_CUDA_ARCHITECTURES "86")
 
 # CUDA compiler flags
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr --allow-unsupported-compiler")
@@ -103,11 +104,89 @@ endif()
 target_compile_options(generate-prime-pool PRIVATE -Wall -Wextra)
 
 # =============================================================================
+# GPU Prime Pool Generator (CUDA-accelerated)
+# =============================================================================
+
+add_executable(generate-prime-pool-gpu tools/cuda_prime_gen.cu)
+
+target_link_libraries(generate-prime-pool-gpu PRIVATE
+    CUDA::cudart
+    CUDA::curand
+)
+
+set_target_properties(generate-prime-pool-gpu PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_compile_options(generate-prime-pool-gpu PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math -DNDEBUG>
+    )
+endif()
+
+# =============================================================================
+# CGBN GPU Prime Pool Generator (High Performance)
+# =============================================================================
+
+add_executable(generate-prime-pool-cgbn tools/cgbn_prime_gen.cu)
+
+target_include_directories(generate-prime-pool-cgbn PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/CGBN/include
+)
+
+target_link_libraries(generate-prime-pool-cgbn PRIVATE
+    CUDA::cudart
+    CUDA::curand
+    gmp
+)
+
+set_target_properties(generate-prime-pool-cgbn PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_compile_options(generate-prime-pool-cgbn PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math -DNDEBUG>
+    )
+endif()
+
+# =============================================================================
+# CGBN Tunable Prime Generator (For Grid Search)
+# =============================================================================
+
+add_executable(generate-prime-pool-cgbn-tune tools/cgbn_prime_gen_tunable.cu)
+
+target_include_directories(generate-prime-pool-cgbn-tune PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/CGBN/include
+)
+
+target_link_libraries(generate-prime-pool-cgbn-tune PRIVATE
+    CUDA::cudart
+    CUDA::curand
+    gmp
+)
+
+set_target_properties(generate-prime-pool-cgbn-tune PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_compile_options(generate-prime-pool-cgbn-tune PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math -DNDEBUG>
+    )
+endif()
+
+# =============================================================================
 # Installation
 # =============================================================================
 
 install(TARGETS ${PROJECT_NAME} DESTINATION bin)
 install(TARGETS generate-prime-pool DESTINATION bin)
+install(TARGETS generate-prime-pool-gpu DESTINATION bin)
+install(TARGETS generate-prime-pool-cgbn DESTINATION bin)
 
 # =============================================================================
 # Print Configuration Summary
