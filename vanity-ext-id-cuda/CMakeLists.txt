@@ -51,6 +51,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     src
     src/cuda
     ${CUDAToolkit_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/CGBN/include
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -58,6 +59,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     OpenSSL::Crypto
     Threads::Threads
     CUDA::cudart
+    gmp
 )
 
 # Enable separable compilation for CUDA
@@ -175,6 +177,74 @@ set_target_properties(generate-prime-pool-cgbn-tune PROPERTIES
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     target_compile_options(generate-prime-pool-cgbn-tune PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math -DNDEBUG>
+    )
+endif()
+
+# =============================================================================
+# CGBN Multiplication Test (Debug Tool)
+# =============================================================================
+
+add_executable(test-cgbn-mul tools/test_cgbn_mul.cu)
+
+target_include_directories(test-cgbn-mul PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/CGBN/include
+)
+
+target_link_libraries(test-cgbn-mul PRIVATE
+    CUDA::cudart
+    gmp
+)
+
+set_target_properties(test-cgbn-mul PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_compile_options(test-cgbn-mul PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math -DNDEBUG>
+    )
+endif()
+
+# =============================================================================
+# CGBN vs Schoolbook Benchmark
+# =============================================================================
+
+add_executable(bench-cgbn-vs-schoolbook tools/bench_cgbn_vs_schoolbook.cu)
+
+target_include_directories(bench-cgbn-vs-schoolbook PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/CGBN/include
+)
+
+target_link_libraries(bench-cgbn-vs-schoolbook PRIVATE
+    CUDA::cudart
+    gmp
+)
+
+set_target_properties(bench-cgbn-vs-schoolbook PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_compile_options(bench-cgbn-vs-schoolbook PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math -DNDEBUG>
+    )
+endif()
+
+target_link_libraries(test-cgbn-mul PRIVATE
+    CUDA::cudart
+    gmp
+)
+
+set_target_properties(test-cgbn-mul PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_compile_options(test-cgbn-mul PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math -DNDEBUG>
     )
 endif()
