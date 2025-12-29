@@ -90,7 +90,9 @@ extern "C" __global__ void vanity_search_kernel(
     const uint32_t* params,
     uint32_t* match_count,
     ShaderMatchResult* matches,
-    uint32_t max_matches
+    uint32_t max_matches,
+    uint64_t start_pair_idx,
+    uint64_t pairs_this_batch
 );
 
 extern "C" __global__ void vanity_search_dict_kernel(
@@ -100,7 +102,9 @@ extern "C" __global__ void vanity_search_dict_kernel(
     const uint32_t* params,
     uint32_t* match_count,
     ShaderMatchResult* matches,
-    uint32_t max_matches
+    uint32_t max_matches,
+    uint64_t start_pair_idx,
+    uint64_t pairs_this_batch
 );
 
 extern "C" __global__ void vanity_search_ai_kernel(
@@ -108,7 +112,9 @@ extern "C" __global__ void vanity_search_ai_kernel(
     const uint32_t* params,
     uint32_t* match_count,
     ShaderMatchResult* matches,
-    uint32_t max_matches
+    uint32_t max_matches,
+    uint64_t start_pair_idx,
+    uint64_t pairs_this_batch
 );
 
 // =============================================================================
@@ -347,37 +353,57 @@ public:
 
         auto start_time = std::chrono::steady_clock::now();
 
-        // With CGBN + 1D grid, we process all pairs in one launch (no batching needed)
-        // Launch kernels on all GPUs
-        for (int gpu_idx = 0; gpu_idx < device_count_; gpu_idx++) {
-            auto& ctx = gpu_contexts_[gpu_idx];
+        // CGBN configuration (TPI=8 optimized for multiplication)
+        constexpr uint32_t BLOCK_SIZE_1D = 256;
+        constexpr uint32_t TPI = 8;   // Threads per instance (optimized)
+        constexpr uint32_t INSTANCES_PER_BLOCK = BLOCK_SIZE_1D / TPI;  // 32
+        
+        // Max blocks we can launch (stay well under CUDA limits)
+        constexpr uint64_t MAX_BLOCKS_PER_LAUNCH = 65535ULL * 256;  // ~16M blocks
+        constexpr uint64_t PAIRS_PER_BATCH = MAX_BLOCKS_PER_LAUNCH * INSTANCES_PER_BLOCK;
+
+        // Timing stats
+        double total_kernel_time = 0.0;
+        double total_memcpy_time = 0.0;
+        uint64_t total_batches = 0;
+        cudaEvent_t kernel_start, kernel_stop;
+
+        // Create CUDA events for timing
+        cudaSetDevice(gpu_contexts_[0].device_id);
+        cudaEventCreate(&kernel_start);
+        cudaEventCreate(&kernel_stop);
+
+        // Upload params once (they don't change between batches)
+        for (auto& ctx : gpu_contexts_) {
             cudaSetDevice(ctx.device_id);
+            uint32_t params[4] = {
+                static_cast<uint32_t>(prime_count_),
+                static_cast<uint32_t>(config.target_prefix.size()),
+                static_cast<uint32_t>(config.target_suffix.size()),
+                0
+            };
+            cudaMemcpy(ctx.d_params, params, sizeof(params), cudaMemcpyHostToDevice);
+        }
 
-            uint32_t start_idx = 0;  // Always start from 0 with single-launch approach
+        uint64_t pairs_processed = 0;
+        
+        while (pairs_processed < total_pairs && !stop_requested_) {
+            uint64_t pairs_remaining = total_pairs - pairs_processed;
+            uint64_t pairs_this_batch = std::min(pairs_remaining, PAIRS_PER_BATCH);
+            
+            uint32_t num_blocks = (pairs_this_batch + INSTANCES_PER_BLOCK - 1) / INSTANCES_PER_BLOCK;
+            
+            dim3 block_size(BLOCK_SIZE_1D, 1);
+            dim3 grid_size(num_blocks, 1);
+
+            // Record kernel start
+            cudaSetDevice(gpu_contexts_[0].device_id);
+            cudaEventRecord(kernel_start, gpu_contexts_[0].stream);
+
+            // Launch on all GPUs (they all process the same batch for now)
+            for (auto& ctx : gpu_contexts_) {
+                cudaSetDevice(ctx.device_id);
                 
-                // Update params
-                uint32_t params[4] = {
-                    static_cast<uint32_t>(prime_count_),
-                    static_cast<uint32_t>(config.target_prefix.size()),
-                    static_cast<uint32_t>(config.target_suffix.size()),
-                    start_idx
-                };
-                cudaMemcpyAsync(ctx.d_params, params, sizeof(params),
-                               cudaMemcpyHostToDevice, ctx.stream);
-                
-                // Calculate grid dimensions for CGBN (TPI=32)
-                // 256 threads per block, 32 threads per instance = 8 instances per block
-                constexpr uint32_t BLOCK_SIZE_1D = 256;
-                constexpr uint32_t INSTANCES_PER_BLOCK = 8;  // 256/32
-
-                // Total pairs to process: N*(N-1)/2
-                uint64_t total_pairs = ((uint64_t)prime_count_ * ((uint64_t)prime_count_ - 1)) / 2;
-                uint32_t num_blocks = (total_pairs + INSTANCES_PER_BLOCK - 1) / INSTANCES_PER_BLOCK;
-
-                dim3 block_size(BLOCK_SIZE_1D, 1);
-                dim3 grid_size(num_blocks, 1);
-
-                // Launch kernel
                 vanity_search_kernel<<<grid_size, block_size, 0, ctx.stream>>>(
                     ctx.d_prime_pool,
                     ctx.d_prefix,
@@ -385,29 +411,48 @@ public:
                     ctx.d_params,
                     ctx.d_match_count,
                     ctx.d_matches,
-                    ctx.max_matches
+                    ctx.max_matches,
+                    pairs_processed,
+                    pairs_this_batch
                 );
-        }
-
-        // Synchronize all GPUs
-        for (auto& ctx : gpu_contexts_) {
-            cudaSetDevice(ctx.device_id);
-            cudaStreamSynchronize(ctx.stream);
-        }
-
-        // Progress callback
-        if (callback) {
-            uint64_t total_matches = 0;
-
-            for (auto& ctx : gpu_contexts_) {
-                cudaSetDevice(ctx.device_id);
-                cudaMemcpy(ctx.h_match_count, ctx.d_match_count, sizeof(uint32_t),
-                          cudaMemcpyDeviceToHost);
-                total_matches += *ctx.h_match_count;
             }
 
-            callback(total_pairs, total_pairs, total_matches);
+            // Record kernel end and synchronize
+            cudaSetDevice(gpu_contexts_[0].device_id);
+            cudaEventRecord(kernel_stop, gpu_contexts_[0].stream);
+            
+            for (auto& ctx : gpu_contexts_) {
+                cudaSetDevice(ctx.device_id);
+                cudaStreamSynchronize(ctx.stream);
+            }
+
+            // Calculate kernel time
+            float kernel_ms = 0;
+            cudaEventElapsedTime(&kernel_ms, kernel_start, kernel_stop);
+            total_kernel_time += kernel_ms / 1000.0;
+            total_batches++;
+
+            pairs_processed += pairs_this_batch;
+
+            // Progress callback with timing
+            auto memcpy_start = std::chrono::steady_clock::now();
+            if (callback) {
+                uint64_t total_matches = 0;
+                for (auto& ctx : gpu_contexts_) {
+                    cudaSetDevice(ctx.device_id);
+                    cudaMemcpy(ctx.h_match_count, ctx.d_match_count, sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost);
+                    total_matches += *ctx.h_match_count;
+                }
+                callback(pairs_processed, total_pairs, total_matches);
+            }
+            auto memcpy_end = std::chrono::steady_clock::now();
+            total_memcpy_time += std::chrono::duration<double>(memcpy_end - memcpy_start).count();
         }
+        
+        // Cleanup events
+        cudaEventDestroy(kernel_start);
+        cudaEventDestroy(kernel_stop);
         
         // Collect results from all GPUs
         std::cout << "\nCUDA: Collecting results from " << device_count_ << " GPU(s)...\n";
@@ -444,6 +489,47 @@ public:
         
         std::cout << "CUDA: Search complete. " << total_pairs << " pairs in "
                   << elapsed << "s (" << (total_pairs / elapsed / 1e9) << " B pairs/s)\n";
+        
+        // Print detailed timing breakdown
+        std::cout << "\n=== PERFORMANCE BREAKDOWN ===\n";
+        std::cout << "Total batches:     " << total_batches << "\n";
+        std::cout << "Pairs per batch:   " << PAIRS_PER_BATCH << "\n";
+        std::cout << "Kernel time:       " << total_kernel_time << "s (" 
+                  << (100.0 * total_kernel_time / elapsed) << "%)\n";
+        std::cout << "Memcpy time:       " << total_memcpy_time << "s ("
+                  << (100.0 * total_memcpy_time / elapsed) << "%)\n";
+        std::cout << "Overhead time:     " << (elapsed - total_kernel_time - total_memcpy_time) << "s ("
+                  << (100.0 * (elapsed - total_kernel_time - total_memcpy_time) / elapsed) << "%)\n";
+        std::cout << "Kernel throughput: " << (total_pairs / total_kernel_time / 1e6) << " M pairs/s\n";
+        std::cout << "Effective TPI:     " << TPI << " threads/instance\n";
+        std::cout << "Instances/block:   " << INSTANCES_PER_BLOCK << "\n";
+        std::cout << "\n--- Memory Analysis ---\n";
+        // Each pair loads: 2 primes × 128 bytes = 256 bytes
+        // Each pair computes: ~294 bytes DER + 32 bytes hash output
+        double bytes_loaded = (double)total_pairs * 256.0;
+        double bytes_computed = (double)total_pairs * (294.0 + 32.0);
+        std::cout << "Data loaded:       " << (bytes_loaded / 1e9) << " GB\n";
+        std::cout << "Load bandwidth:    " << (bytes_loaded / total_kernel_time / 1e9) << " GB/s\n";
+        
+        // Get GPU memory bandwidth
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, 0);
+        double peak_bw = (double)prop.memoryClockRate * 1000.0 * (prop.memoryBusWidth / 8) * 2 / 1e9;
+        std::cout << "GPU peak bandwidth:" << peak_bw << " GB/s\n";
+        std::cout << "BW utilization:    " << (100.0 * bytes_loaded / total_kernel_time / 1e9 / peak_bw) << "%\n";
+        
+        std::cout << "\n--- Compute Analysis ---\n";
+        // Each pair: 1024×1024 mul + SHA-256(294 bytes, 5 rounds)
+        // SHA-256: 64 rounds × 5 blocks = 320 ops per pair (rough)
+        double sha_ops = (double)total_pairs * 64 * 5;
+        std::cout << "SHA-256 rounds:    " << (sha_ops / 1e9) << " billion\n";
+        std::cout << "SHA throughput:    " << (total_pairs / total_kernel_time / 1e6) << " M hashes/s\n";
+        
+        // Thread efficiency
+        double active_threads = (double)total_pairs * TPI;  // TPI threads per pair for multiplication
+        double useful_threads = (double)total_pairs * 1;     // Only 1 thread does SHA/match
+        std::cout << "Thread efficiency: " << (100.0 * useful_threads / active_threads) << "% (1/" << TPI << " threads do SHA)\n";
+        std::cout << "=============================\n";
         
         running_ = false;
         return results;
@@ -517,35 +603,39 @@ public:
         uint64_t total_pairs = (uint64_t)prime_count_ * (prime_count_ - 1) / 2;
         auto start_time = std::chrono::steady_clock::now();
 
-        // With CGBN + 1D grid, we process all pairs in one launch (no batching needed)
-        // Launch kernels on all GPUs
-        for (int gpu_idx = 0; gpu_idx < device_count_; gpu_idx++) {
-            auto& ctx = gpu_contexts_[gpu_idx];
+        // CGBN configuration (TPI=8 optimized for multiplication)
+        constexpr uint32_t BLOCK_SIZE_1D = 256;
+        constexpr uint32_t TPI = 8;
+        constexpr uint32_t INSTANCES_PER_BLOCK = BLOCK_SIZE_1D / TPI;  // 32
+        constexpr uint64_t MAX_BLOCKS_PER_LAUNCH = 65535ULL * 256;
+        constexpr uint64_t PAIRS_PER_BATCH = MAX_BLOCKS_PER_LAUNCH * INSTANCES_PER_BLOCK;
+
+        // Upload params once
+        for (auto& ctx : gpu_contexts_) {
             cudaSetDevice(ctx.device_id);
+            uint32_t params[4] = {
+                static_cast<uint32_t>(prime_count_),
+                static_cast<uint32_t>(valid_words.size()),
+                static_cast<uint32_t>(min_len),
+                0
+            };
+            cudaMemcpy(ctx.d_params, params, sizeof(params), cudaMemcpyHostToDevice);
+        }
 
-            uint32_t start_idx = 0;  // Always start from 0 with single-launch approach
+        uint64_t pairs_processed = 0;
+        
+        while (pairs_processed < total_pairs && !stop_requested_) {
+            uint64_t pairs_remaining = total_pairs - pairs_processed;
+            uint64_t pairs_this_batch = std::min(pairs_remaining, PAIRS_PER_BATCH);
+            
+            uint32_t num_blocks = (pairs_this_batch + INSTANCES_PER_BLOCK - 1) / INSTANCES_PER_BLOCK;
+            
+            dim3 block_size(BLOCK_SIZE_1D, 1);
+            dim3 grid_size(num_blocks, 1);
+
+            for (auto& ctx : gpu_contexts_) {
+                cudaSetDevice(ctx.device_id);
                 
-                // Update params: [pool_size, num_words, min_len, start_idx]
-                uint32_t params[4] = {
-                    static_cast<uint32_t>(prime_count_),
-                    static_cast<uint32_t>(valid_words.size()),
-                    static_cast<uint32_t>(min_len),
-                    start_idx
-                };
-                cudaMemcpyAsync(ctx.d_params, params, sizeof(params),
-                               cudaMemcpyHostToDevice, ctx.stream);
-                
-                // Calculate grid dimensions for CGBN (TPI=32)
-                constexpr uint32_t BLOCK_SIZE_1D = 256;
-                constexpr uint32_t INSTANCES_PER_BLOCK = 8;
-
-                uint64_t total_pairs = ((uint64_t)prime_count_ * ((uint64_t)prime_count_ - 1)) / 2;
-                uint32_t num_blocks = (total_pairs + INSTANCES_PER_BLOCK - 1) / INSTANCES_PER_BLOCK;
-
-                dim3 block_size(BLOCK_SIZE_1D, 1);
-                dim3 grid_size(num_blocks, 1);
-
-                // Launch kernel
                 vanity_search_dict_kernel<<<grid_size, block_size, 0, ctx.stream>>>(
                     ctx.d_prime_pool,
                     ctx.d_dictionary,
@@ -553,28 +643,29 @@ public:
                     ctx.d_params,
                     ctx.d_match_count,
                     ctx.d_matches,
-                    ctx.max_matches
+                    ctx.max_matches,
+                    pairs_processed,
+                    pairs_this_batch
                 );
-        }
-
-        // Synchronize all GPUs
-        for (auto& ctx : gpu_contexts_) {
-            cudaSetDevice(ctx.device_id);
-            cudaStreamSynchronize(ctx.stream);
-        }
-
-        // Progress callback
-        if (callback) {
-            uint64_t total_matches = 0;
+            }
 
             for (auto& ctx : gpu_contexts_) {
                 cudaSetDevice(ctx.device_id);
-                cudaMemcpy(ctx.h_match_count, ctx.d_match_count, sizeof(uint32_t),
-                          cudaMemcpyDeviceToHost);
-                total_matches += *ctx.h_match_count;
+                cudaStreamSynchronize(ctx.stream);
             }
 
-            callback(total_pairs, total_pairs, total_matches);
+            pairs_processed += pairs_this_batch;
+
+            if (callback) {
+                uint64_t total_matches = 0;
+                for (auto& ctx : gpu_contexts_) {
+                    cudaSetDevice(ctx.device_id);
+                    cudaMemcpy(ctx.h_match_count, ctx.d_match_count, sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost);
+                    total_matches += *ctx.h_match_count;
+                }
+                callback(pairs_processed, total_pairs, total_matches);
+            }
         }
         
         // Collect results from all GPUs
@@ -654,62 +745,67 @@ public:
         uint64_t total_pairs = (uint64_t)prime_count_ * (prime_count_ - 1) / 2;
         auto start_time = std::chrono::steady_clock::now();
 
-        // With CGBN + 1D grid, we process all pairs in one launch (no batching needed)
-        // Launch kernels on all GPUs
-        for (int gpu_idx = 0; gpu_idx < device_count_; gpu_idx++) {
-            auto& ctx = gpu_contexts_[gpu_idx];
+        // CGBN configuration (TPI=8 optimized for multiplication)
+        constexpr uint32_t BLOCK_SIZE_1D = 256;
+        constexpr uint32_t TPI = 8;
+        constexpr uint32_t INSTANCES_PER_BLOCK = BLOCK_SIZE_1D / TPI;  // 32
+        constexpr uint64_t MAX_BLOCKS_PER_LAUNCH = 65535ULL * 256;
+        constexpr uint64_t PAIRS_PER_BATCH = MAX_BLOCKS_PER_LAUNCH * INSTANCES_PER_BLOCK;
+
+        // Upload params once
+        for (auto& ctx : gpu_contexts_) {
             cudaSetDevice(ctx.device_id);
+            uint32_t params[4] = {
+                static_cast<uint32_t>(prime_count_),
+                min_ai_count,
+                0,
+                0
+            };
+            cudaMemcpy(ctx.d_params, params, sizeof(params), cudaMemcpyHostToDevice);
+        }
 
-            uint32_t start_idx = 0;  // Always start from 0 with single-launch approach
+        uint64_t pairs_processed = 0;
+        
+        while (pairs_processed < total_pairs && !stop_requested_) {
+            uint64_t pairs_remaining = total_pairs - pairs_processed;
+            uint64_t pairs_this_batch = std::min(pairs_remaining, PAIRS_PER_BATCH);
+            
+            uint32_t num_blocks = (pairs_this_batch + INSTANCES_PER_BLOCK - 1) / INSTANCES_PER_BLOCK;
+            
+            dim3 block_size(BLOCK_SIZE_1D, 1);
+            dim3 grid_size(num_blocks, 1);
+
+            for (auto& ctx : gpu_contexts_) {
+                cudaSetDevice(ctx.device_id);
                 
-                // Update params: [pool_size, min_ai_count, 0, start_idx]
-                uint32_t params[4] = {
-                    static_cast<uint32_t>(prime_count_),
-                    min_ai_count,
-                    0,
-                    start_idx
-                };
-                cudaMemcpyAsync(ctx.d_params, params, sizeof(params),
-                               cudaMemcpyHostToDevice, ctx.stream);
-                
-                // Calculate grid dimensions for CGBN (TPI=32)
-                constexpr uint32_t BLOCK_SIZE_1D = 256;
-                constexpr uint32_t INSTANCES_PER_BLOCK = 8;
-
-                uint64_t total_pairs = ((uint64_t)prime_count_ * ((uint64_t)prime_count_ - 1)) / 2;
-                uint32_t num_blocks = (total_pairs + INSTANCES_PER_BLOCK - 1) / INSTANCES_PER_BLOCK;
-
-                dim3 block_size(BLOCK_SIZE_1D, 1);
-                dim3 grid_size(num_blocks, 1);
-
-                // Launch the fast AI kernel
                 vanity_search_ai_kernel<<<grid_size, block_size, 0, ctx.stream>>>(
                     ctx.d_prime_pool,
                     ctx.d_params,
                     ctx.d_match_count,
                     ctx.d_matches,
-                    ctx.max_matches
+                    ctx.max_matches,
+                    pairs_processed,
+                    pairs_this_batch
                 );
-        }
-
-        // Synchronize all GPUs
-        for (auto& ctx : gpu_contexts_) {
-            cudaSetDevice(ctx.device_id);
-            cudaStreamSynchronize(ctx.stream);
-        }
-
-        // Progress callback
-        if (callback) {
-            uint64_t total_matches = 0;
+            }
 
             for (auto& ctx : gpu_contexts_) {
                 cudaSetDevice(ctx.device_id);
-                cudaMemcpy(ctx.h_match_count, ctx.d_match_count, sizeof(uint32_t),
-                          cudaMemcpyDeviceToHost);
-                total_matches += *ctx.h_match_count;
+                cudaStreamSynchronize(ctx.stream);
             }
 
-            callback(total_pairs, total_pairs, total_matches);
+            pairs_processed += pairs_this_batch;
+
+            if (callback) {
+                uint64_t total_matches = 0;
+                for (auto& ctx : gpu_contexts_) {
+                    cudaSetDevice(ctx.device_id);
+                    cudaMemcpy(ctx.h_match_count, ctx.d_match_count, sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost);
+                    total_matches += *ctx.h_match_count;
+                }
+                callback(pairs_processed, total_pairs, total_matches);
+            }
         }
         
         // Collect results from all GPUs
